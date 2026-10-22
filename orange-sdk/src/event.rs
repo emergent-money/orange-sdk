@@ -1,5 +1,6 @@
 use crate::logging::Logger;
 use crate::store::{self, MppOutcome, PaymentId, RebalanceEnabledCache, TxMetadataStore, TxType};
+use crate::trusted_wallet::{DynTrustedWalletInterface, TrustedError};
 
 use crate::dyn_store::DynStore;
 use ldk_node::bitcoin::hashes::Hash;
@@ -520,11 +521,18 @@ impl Future for EventFuture {
 	}
 }
 
+/// The trusted wallet as seen by [`LdkEventHandler`], which starts before the trusted wallet has
+/// finished initializing. Holds `None` until [`crate::Wallet::new`] has built both wallets; if
+/// initialization fails the sender is dropped while still holding `None`.
+pub(crate) type TrustedWalletHandle = watch::Receiver<Option<Arc<Box<DynTrustedWalletInterface>>>>;
+
 #[derive(Clone)]
 pub(crate) struct LdkEventHandler {
 	pub(crate) event_queue: Arc<EventQueue>,
 	pub(crate) ldk_node: Arc<ldk_node::Node>,
 	pub(crate) tx_metadata: store::TxMetadataStore,
+	pub(crate) store: Arc<dyn DynStore>,
+	pub(crate) trusted: TrustedWalletHandle,
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
 	pub(crate) splice_pending_inbox: Arc<crate::lightning_wallet::SplicePendingInbox>,
@@ -604,14 +612,15 @@ impl LdkEventHandler {
 				{
 					log_error!(self.logger, "Failed to add PaymentReceived event: {e:?}");
 				}
+				// If this was the lightning leg of a wrapped receive, its preimage is no longer needed.
+				if let Err(e) = store::remove_wrapped_receive(&*self.store, &payment_hash).await {
+					log_error!(self.logger, "Failed to remove wrapped receive {payment_hash}: {e}");
+				}
 				let _ = self.payment_receipt_sender.send(());
 			},
 			ldk_node::Event::PaymentForwarded { .. } => {},
-			ldk_node::Event::PaymentClaimable { .. } => {
-				log_warn!(
-					self.logger,
-					"Unexpected PaymentClaimable event received. This is likely due to a bug in the LDK Node implementation."
-				);
+			ldk_node::Event::PaymentClaimable { payment_hash, claimable_amount_msat, .. } => {
+				self.handle_payment_claimable(payment_hash, claimable_amount_msat).await;
 			},
 			ldk_node::Event::ChannelPending { funding_txo, .. } => {
 				log_debug!(self.logger, "Received ChannelPending event");
@@ -701,6 +710,103 @@ impl LdkEventHandler {
 
 		if let Err(e) = self.ldk_node.event_handled() {
 			log_error!(self.logger, "Failed to handle event: {e:?}");
+		}
+	}
+
+	/// Claims or fails a payment to an invoice from
+	/// [`crate::lightning_wallet::LightningWallet::get_bolt11_invoice_for_hash`], the only kind of
+	/// payment ldk-node leaves for us to claim. ldk-node requires that every such payment is
+	/// promptly claimed or failed back.
+	///
+	/// We claim only a payment for a wrapped receive we still hold the preimage for, of at least
+	/// the amount requested, whose trusted leg has not been paid. Failing back is always safe: the
+	/// payer can still pay the trusted leg.
+	async fn handle_payment_claimable(
+		&self, payment_hash: PaymentHash, claimable_amount_msat: u64,
+	) {
+		let entry = match store::read_wrapped_receive(&*self.store, &payment_hash).await {
+			Ok(Some(entry)) => entry,
+			Ok(None) => {
+				log_warn!(
+					self.logger,
+					"Failing back claimable payment {payment_hash}: not a pending wrapped receive"
+				);
+				self.fail_claimable_payment(payment_hash);
+				return;
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failing back claimable payment {payment_hash}: failed to read wrapped receive: {e}"
+				);
+				self.fail_claimable_payment(payment_hash);
+				return;
+			},
+		};
+
+		if claimable_amount_msat < entry.amount_msat {
+			log_warn!(
+				self.logger,
+				"Failing back wrapped receive {payment_hash}: claimable {claimable_amount_msat} msat is below the requested {} msat",
+				entry.amount_msat
+			);
+			self.fail_claimable_payment(payment_hash);
+			return;
+		}
+
+		match self.trusted_leg_paid(payment_hash).await {
+			Ok(false) => {},
+			Ok(true) => {
+				log_warn!(
+					self.logger,
+					"Failing back wrapped receive {payment_hash}: its trusted leg was already paid"
+				);
+				if let Err(e) = store::remove_wrapped_receive(&*self.store, &payment_hash).await {
+					log_error!(self.logger, "Failed to remove wrapped receive {payment_hash}: {e}");
+				}
+				self.fail_claimable_payment(payment_hash);
+				return;
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failing back wrapped receive {payment_hash}: failed to check its trusted leg: {e}"
+				);
+				self.fail_claimable_payment(payment_hash);
+				return;
+			},
+		}
+
+		let preimage = PaymentPreimage(entry.preimage);
+		if let Err(e) = self.ldk_node.bolt11_payment().claim_for_hash(
+			payment_hash,
+			claimable_amount_msat,
+			preimage,
+		) {
+			log_error!(self.logger, "Failed to claim wrapped receive {payment_hash}: {e}");
+			self.fail_claimable_payment(payment_hash);
+		}
+	}
+
+	/// Whether the trusted wallet already holds a payment for the trusted leg of a wrapped receive,
+	/// waiting for the trusted wallet to finish initializing if needed.
+	async fn trusted_leg_paid(&self, payment_hash: PaymentHash) -> Result<bool, TrustedError> {
+		let trusted = {
+			let mut handle = self.trusted.clone();
+			match handle.wait_for(Option::is_some).await {
+				Ok(trusted) => trusted.as_ref().map(Arc::clone),
+				Err(_) => None,
+			}
+		};
+		match trusted {
+			Some(trusted) => trusted.has_lightning_receive_for_hash(payment_hash.0).await,
+			None => Err(TrustedError::Other("Trusted wallet failed to initialize".to_owned())),
+		}
+	}
+
+	fn fail_claimable_payment(&self, payment_hash: PaymentHash) {
+		if let Err(e) = self.ldk_node.bolt11_payment().fail_for_hash(payment_hash) {
+			log_error!(self.logger, "Failed to fail back claimable payment {payment_hash}: {e}");
 		}
 	}
 

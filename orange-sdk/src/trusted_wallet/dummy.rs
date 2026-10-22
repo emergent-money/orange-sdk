@@ -385,6 +385,16 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		})
 	}
 
+	fn get_bolt11_invoice_with_preimage(
+		&self, _amount: Amount, _preimage: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			Err(TrustedError::UnsupportedOperation(
+				"Dummy wallet does not support invoices for a caller-supplied preimage".to_owned(),
+			))
+		})
+	}
+
 	fn list_payments(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<Payment>, TrustedError>> + Send + '_>> {
@@ -572,4 +582,32 @@ fn mangle_payment_id(id: [u8; 32]) -> [u8; 32] {
 		*i = i.wrapping_add(0x42);
 	}
 	mangled
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Built around an ldk-node that is never started, so no bitcoind is needed.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn caller_preimage_invoices_are_unsupported() {
+		let mut builder = ldk_node::Builder::new();
+		builder.set_network(Network::Regtest);
+		let dir = temp_dir().join(format!("orange-sdk-dummy-preimage-test-{}", Uuid::now_v7()));
+		builder.set_storage_dir_path(dir.to_str().unwrap().to_string());
+		let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes([3; 64]);
+		let (_payment_success_sender, payment_success_flag) = watch::channel(());
+		let wallet = DummyTrustedWallet {
+			current_bal_msats: Arc::new(AtomicU64::new(0)),
+			payments: Arc::new(RwLock::new(Vec::new())),
+			ldk_node: Arc::new(builder.build(node_entropy).unwrap()),
+			payment_success_flag,
+		};
+
+		let res = wallet
+			.get_bolt11_invoice_with_preimage(Amount::from_sats(1_000).unwrap(), [0x11; 32])
+			.await;
+		assert!(matches!(res, Err(TrustedError::UnsupportedOperation(_))));
+		assert!(!wallet.has_lightning_receive_for_hash([0x22; 32]).await.unwrap());
+	}
 }

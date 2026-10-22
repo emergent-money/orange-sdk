@@ -18,7 +18,7 @@ use ldk_node::bitcoin::Txid;
 use ldk_node::bitcoin::hex::{DisplayHex, FromHex};
 use ldk_node::lightning::io;
 use ldk_node::lightning::ln::msgs::DecodeError;
-use ldk_node::lightning::types::payment::PaymentPreimage;
+use ldk_node::lightning::types::payment::{PaymentHash, PaymentPreimage};
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
@@ -34,6 +34,14 @@ use tokio::sync::Mutex;
 const STORE_PRIMARY_KEY: &str = "orange_sdk";
 const STORE_SECONDARY_KEY: &str = "payment_store";
 const SPLICE_OUT_SECONDARY_KEY: &str = "splice_out";
+const WRAPPED_RECEIVES_SECONDARY_KEY: &str = "wrapped_receives";
+
+/// How long the preimage of a wrapped receive is kept before [`prune_wrapped_receives`] drops it.
+///
+/// It must outlive both invoices of the receive: the trusted (Spark) invoice expires after 30 days
+/// and the self-custodial one after a day, so 31 days leaves a day of margin past the longer-lived
+/// one.
+pub(crate) const WRAPPED_RECEIVE_RETENTION: Duration = Duration::from_secs(31 * 24 * 60 * 60);
 
 /// The status of a transaction. This is used to track the state of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,6 +821,120 @@ pub(crate) async fn read_splice_outs(store: &dyn DynStore) -> Vec<PaymentDetails
 	splice_outs
 }
 
+/// The secret half of a receive created by [`crate::Wallet::get_wrapped_receive`]: the preimage this
+/// node needs to claim the self-custodial leg, stored under the payment hash until that leg is
+/// claimed, retired, or the entry expires (see [`WRAPPED_RECEIVE_RETENTION`]).
+///
+/// The preimage is overwritten when the entry is dropped and is never logged.
+pub(crate) struct WrappedReceiveEntry {
+	/// The payment preimage.
+	pub(crate) preimage: [u8; 32],
+	/// When the receive was created, in seconds since the epoch.
+	pub(crate) created_at_secs: u64,
+	/// The amount requested, in msats. A claimable payment below it is failed back.
+	pub(crate) amount_msat: u64,
+}
+
+impl_writeable_tlv_based!(WrappedReceiveEntry, {
+	(0, preimage, required),
+	(2, created_at_secs, required),
+	(4, amount_msat, required),
+});
+
+impl Drop for WrappedReceiveEntry {
+	fn drop(&mut self) {
+		wipe(&mut self.preimage);
+	}
+}
+
+/// Overwrites `bytes` with zeros, keeping the optimizer from eliding the writes as dead stores.
+fn wipe(bytes: &mut [u8]) {
+	bytes.fill(0);
+	std::hint::black_box(bytes);
+}
+
+/// Persists the preimage of a wrapped receive under its payment hash.
+pub(crate) async fn write_wrapped_receive(
+	store: &dyn DynStore, payment_hash: &PaymentHash, entry: &WrappedReceiveEntry,
+) -> Result<(), io::Error> {
+	KVStore::write(
+		store,
+		STORE_PRIMARY_KEY,
+		WRAPPED_RECEIVES_SECONDARY_KEY,
+		&payment_hash.0.to_lower_hex_string(),
+		entry.encode(),
+	)
+	.await
+}
+
+/// Reads the wrapped receive stored under `payment_hash`, if any.
+pub(crate) async fn read_wrapped_receive(
+	store: &dyn DynStore, payment_hash: &PaymentHash,
+) -> Result<Option<WrappedReceiveEntry>, io::Error> {
+	let key = payment_hash.0.to_lower_hex_string();
+	let mut bytes =
+		match KVStore::read(store, STORE_PRIMARY_KEY, WRAPPED_RECEIVES_SECONDARY_KEY, &key).await {
+			Ok(bytes) => bytes,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+			Err(e) => return Err(e),
+		};
+	let entry = WrappedReceiveEntry::read(&mut &bytes[..]);
+	wipe(&mut bytes);
+	entry.map(Some).map_err(|_| {
+		io::Error::new(io::ErrorKind::InvalidData, "Invalid data in wrapped receive storage")
+	})
+}
+
+/// Removes the wrapped receive stored under `payment_hash`. Removing an absent entry succeeds.
+pub(crate) async fn remove_wrapped_receive(
+	store: &dyn DynStore, payment_hash: &PaymentHash,
+) -> Result<(), io::Error> {
+	let key = payment_hash.0.to_lower_hex_string();
+	match KVStore::remove(store, STORE_PRIMARY_KEY, WRAPPED_RECEIVES_SECONDARY_KEY, &key, false)
+		.await
+	{
+		Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+		_ => Ok(()),
+	}
+}
+
+/// Drops every wrapped receive created more than [`WRAPPED_RECEIVE_RETENTION`] before `now` (a
+/// duration since the epoch), returning how many were dropped. Entries that cannot be decoded are
+/// left in place.
+pub(crate) async fn prune_wrapped_receives(
+	store: Arc<dyn DynStore>, now: Duration,
+) -> Result<usize, io::Error> {
+	let keys =
+		KVStore::list(store.as_ref(), STORE_PRIMARY_KEY, WRAPPED_RECEIVES_SECONDARY_KEY).await?;
+	let records = read_keys_bounded(
+		Arc::clone(&store),
+		STORE_PRIMARY_KEY,
+		WRAPPED_RECEIVES_SECONDARY_KEY,
+		keys,
+	)
+	.await?;
+	let mut pruned = 0;
+	for (key, mut bytes) in records {
+		let expired = WrappedReceiveEntry::read(&mut &bytes[..]).is_ok_and(|entry| {
+			now.saturating_sub(Duration::from_secs(entry.created_at_secs))
+				> WRAPPED_RECEIVE_RETENTION
+		});
+		wipe(&mut bytes);
+		if expired {
+			KVStore::remove(
+				store.as_ref(),
+				STORE_PRIMARY_KEY,
+				WRAPPED_RECEIVES_SECONDARY_KEY,
+				&key,
+				false,
+			)
+			.await?;
+			pruned += 1;
+		}
+	}
+	Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -990,6 +1112,76 @@ mod tests {
 			)
 			.await;
 		assert_eq!(tx_metadata.record_mpp_leg(plain, Some((1, [0u8; 32]))).await, None);
+	}
+
+	#[tokio::test]
+	async fn wrapped_receive_round_trips_and_is_removed() {
+		let (_path, store) = temp_sqlite_store();
+		let payment_hash = PaymentHash([5u8; 32]);
+		assert!(read_wrapped_receive(&*store, &payment_hash).await.unwrap().is_none());
+
+		let entry = WrappedReceiveEntry {
+			preimage: [9u8; 32],
+			created_at_secs: 1_700_000_000,
+			amount_msat: 21_000,
+		};
+		write_wrapped_receive(&*store, &payment_hash, &entry).await.unwrap();
+
+		let read = read_wrapped_receive(&*store, &payment_hash).await.unwrap().expect("stored");
+		assert_eq!(read.preimage, [9u8; 32]);
+		assert_eq!(read.created_at_secs, 1_700_000_000);
+		assert_eq!(read.amount_msat, 21_000);
+		let keys = KVStore::list(store.as_ref(), STORE_PRIMARY_KEY, WRAPPED_RECEIVES_SECONDARY_KEY)
+			.await
+			.unwrap();
+		assert_eq!(keys, vec![payment_hash.0.to_lower_hex_string()]);
+
+		remove_wrapped_receive(&*store, &payment_hash).await.unwrap();
+		assert!(read_wrapped_receive(&*store, &payment_hash).await.unwrap().is_none());
+		// Removing an absent entry, as on every non-wrapped `PaymentReceived`, is not an error.
+		remove_wrapped_receive(&*store, &payment_hash).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn prune_wrapped_receives_drops_only_expired_entries() {
+		let (_path, store) = temp_sqlite_store();
+		let now = Duration::from_secs(1_800_000_000);
+		let fresh = PaymentHash([1u8; 32]);
+		let at_retention = PaymentHash([2u8; 32]);
+		let aged = PaymentHash([3u8; 32]);
+		for (payment_hash, age) in [
+			(fresh, Duration::from_secs(60 * 60 * 24)),
+			(at_retention, WRAPPED_RECEIVE_RETENTION),
+			(aged, WRAPPED_RECEIVE_RETENTION + Duration::from_secs(1)),
+		] {
+			let entry = WrappedReceiveEntry {
+				preimage: [7u8; 32],
+				created_at_secs: (now - age).as_secs(),
+				amount_msat: 1_000,
+			};
+			write_wrapped_receive(&*store, &payment_hash, &entry).await.unwrap();
+		}
+		// An entry we cannot decode is left alone rather than dropped.
+		let undecodable = [4u8; 32].to_lower_hex_string();
+		KVStore::write(
+			store.as_ref(),
+			STORE_PRIMARY_KEY,
+			WRAPPED_RECEIVES_SECONDARY_KEY,
+			&undecodable,
+			vec![0xff],
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(prune_wrapped_receives(Arc::clone(&store), now).await.unwrap(), 1);
+		assert!(read_wrapped_receive(&*store, &fresh).await.unwrap().is_some());
+		assert!(read_wrapped_receive(&*store, &at_retention).await.unwrap().is_some());
+		assert!(read_wrapped_receive(&*store, &aged).await.unwrap().is_none());
+		let keys = KVStore::list(store.as_ref(), STORE_PRIMARY_KEY, WRAPPED_RECEIVES_SECONDARY_KEY)
+			.await
+			.unwrap();
+		assert!(keys.contains(&undecodable));
+		assert_eq!(prune_wrapped_receives(store, now).await.unwrap(), 0);
 	}
 
 	#[test]

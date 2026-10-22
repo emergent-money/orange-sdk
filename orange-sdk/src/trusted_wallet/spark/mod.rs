@@ -3,7 +3,8 @@
 pub(crate) mod spark_store;
 
 use crate::bitcoin::Network;
-use crate::bitcoin::hex::FromHex;
+use crate::bitcoin::hashes::{Hash, sha256};
+use crate::bitcoin::hex::{DisplayHex, FromHex};
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
 use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
@@ -128,17 +129,7 @@ impl TrustedWalletInterface for Spark {
 	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>> {
 		Box::pin(async move {
 			// check amount is not msat value
-			let amount_sats = match amount {
-				Some(a) => {
-					let sats = a.sats().map_err(|_| {
-						TrustedError::UnsupportedOperation(
-							"msat amounts not supported by spark".to_owned(),
-						)
-					})?;
-					Some(sats)
-				},
-				None => None,
-			};
+			let amount_sats = amount.map(whole_sats).transpose()?;
 
 			let params = ReceivePaymentRequest {
 				payment_method: ReceivePaymentMethod::Bolt11Invoice {
@@ -147,12 +138,48 @@ impl TrustedWalletInterface for Spark {
 					expiry_secs: None,
 					payment_hash: None,
 					receiver_identity_public_key: None,
+					preimage: None,
 				},
 			};
 			let res = self.spark_wallet.receive_payment(params).await?;
 
 			Bolt11Invoice::from_str(&res.payment_request)
 				.map_err(|e| TrustedError::Other(format!("Failed to parse invoice: {e}")))
+		})
+	}
+
+	fn get_bolt11_invoice_with_preimage(
+		&self, amount: Amount, preimage: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			let amount_sats = whole_sats(amount)?;
+			let payment_hash = PaymentHash(sha256::Hash::hash(&preimage).to_byte_array());
+
+			let params = ReceivePaymentRequest {
+				payment_method: ReceivePaymentMethod::Bolt11Invoice {
+					description: "".to_string(), // empty description for smaller QRs and better privacy
+					amount_sats: Some(amount_sats),
+					expiry_secs: None,
+					payment_hash: None,
+					receiver_identity_public_key: None,
+					preimage: Some(preimage.to_lower_hex_string()),
+				},
+			};
+			let res = self.spark_wallet.receive_payment(params).await?;
+
+			let invoice = Bolt11Invoice::from_str(&res.payment_request)
+				.map_err(|e| TrustedError::Other(format!("Failed to parse invoice: {e}")))?;
+			check_invoice_payment_hash(&invoice, payment_hash)?;
+			Ok(invoice)
+		})
+	}
+
+	fn has_lightning_receive_for_hash(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<bool, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			let res = self.spark_wallet.list_payments(ListPaymentsRequest::default()).await?;
+			Ok(res.payments.iter().any(|p| is_lightning_receive_for_hash(p, &payment_hash)))
 		})
 	}
 
@@ -607,6 +634,44 @@ impl SparkEventHandler {
 	}
 }
 
+/// Converts `amount` to whole sats, refusing msat amounts, which Spark does not support.
+fn whole_sats(amount: Amount) -> Result<u64, TrustedError> {
+	amount.sats().map_err(|_| {
+		TrustedError::UnsupportedOperation("msat amounts not supported by spark".to_owned())
+	})
+}
+
+/// Refuses `invoice` unless it commits to `payment_hash`, so that an invoice requested for a
+/// caller-supplied preimage can only settle with that preimage.
+fn check_invoice_payment_hash(
+	invoice: &Bolt11Invoice, payment_hash: PaymentHash,
+) -> Result<(), TrustedError> {
+	if invoice.payment_hash() == payment_hash {
+		Ok(())
+	} else {
+		Err(TrustedError::WalletOperationFailed(format!(
+			"Spark returned an invoice for payment hash {} instead of {payment_hash}",
+			invoice.payment_hash()
+		)))
+	}
+}
+
+/// Whether `payment` is an incoming Lightning payment, in any state, for `payment_hash`.
+fn is_lightning_receive_for_hash(
+	payment: &breez_sdk_spark::Payment, payment_hash: &[u8; 32],
+) -> bool {
+	if payment.payment_type != PaymentType::Receive {
+		return false;
+	}
+	match &payment.details {
+		Some(PaymentDetails::Lightning { htlc_details, .. }) => {
+			let hash: Option<[u8; 32]> = FromHex::from_hex(&htlc_details.payment_hash).ok();
+			hash.as_ref() == Some(payment_hash)
+		},
+		_ => false,
+	}
+}
+
 fn parse_payment_id(id: &str) -> Result<[u8; 32], TrustedError> {
 	// Spark uses UUIDs for payment IDs, so we need to convert them
 	// to our format. Spark uses a UUID in the format `SparkLightningSendRequest:<uuid>`
@@ -661,5 +726,95 @@ impl TryFrom<breez_sdk_spark::Payment> for Payment {
 			outbound: value.payment_type == PaymentType::Send,
 			time_since_epoch: Duration::from_secs(value.timestamp),
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use breez_sdk_spark::{SparkHtlcDetails, SparkHtlcStatus};
+	use ldk_node::bitcoin::secp256k1::{Secp256k1, SecretKey};
+	use ldk_node::lightning_invoice::{Currency, InvoiceBuilder};
+	use ldk_node::lightning_types::payment::PaymentSecret;
+
+	fn invoice_for(payment_hash: PaymentHash) -> Bolt11Invoice {
+		let secp = Secp256k1::new();
+		let key = SecretKey::from_slice(&[42; 32]).unwrap();
+		InvoiceBuilder::new(Currency::Regtest)
+			.description(String::new())
+			.amount_milli_satoshis(1_000_000)
+			.payment_hash(payment_hash)
+			.payment_secret(PaymentSecret([0; 32]))
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(144)
+			.build_signed(|msg| secp.sign_ecdsa_recoverable(msg, &key))
+			.unwrap()
+	}
+
+	// The Breez SDK cannot be built without reaching the Spark operators, so this exercises the
+	// check `get_bolt11_invoice_with_preimage` applies to the invoice Spark returns.
+	#[test]
+	fn refuses_an_invoice_for_another_payment_hash() {
+		let preimage = [0x11u8; 32];
+		let payment_hash = PaymentHash(sha256::Hash::hash(&preimage).to_byte_array());
+		assert!(check_invoice_payment_hash(&invoice_for(payment_hash), payment_hash).is_ok());
+
+		let other = PaymentHash([0x22; 32]);
+		assert!(matches!(
+			check_invoice_payment_hash(&invoice_for(other), payment_hash),
+			Err(TrustedError::WalletOperationFailed(_))
+		));
+	}
+
+	#[test]
+	fn refuses_msat_amounts() {
+		assert_eq!(whole_sats(Amount::from_sats(21).unwrap()).unwrap(), 21);
+		assert!(matches!(
+			whole_sats(Amount::from_milli_sats(21_500).unwrap()),
+			Err(TrustedError::UnsupportedOperation(_))
+		));
+	}
+
+	fn lightning_payment(
+		payment_type: PaymentType, status: PaymentStatus, payment_hash: [u8; 32],
+	) -> breez_sdk_spark::Payment {
+		breez_sdk_spark::Payment {
+			id: "SparkLightningReceiveRequest:0191b8d0-0000-7000-8000-000000000000".to_owned(),
+			payment_type,
+			status,
+			amount: 1_000,
+			fees: 0,
+			timestamp: 1_700_000_000,
+			method: breez_sdk_spark::PaymentMethod::Lightning,
+			details: Some(PaymentDetails::Lightning {
+				description: None,
+				invoice: String::new(),
+				destination_pubkey: String::new(),
+				htlc_details: SparkHtlcDetails {
+					payment_hash: payment_hash.to_lower_hex_string(),
+					preimage: None,
+					expiry_time: 0,
+					status: SparkHtlcStatus::PreimageShared,
+				},
+				lnurl_pay_info: None,
+				lnurl_withdraw_info: None,
+				lnurl_receive_metadata: None,
+				conversion_info: None,
+			}),
+			conversion_details: None,
+		}
+	}
+
+	#[test]
+	fn finds_lightning_receives_by_payment_hash() {
+		let hash = [0x33; 32];
+		for status in [PaymentStatus::Pending, PaymentStatus::Completed, PaymentStatus::Failed] {
+			let payment = lightning_payment(PaymentType::Receive, status, hash);
+			assert!(is_lightning_receive_for_hash(&payment, &hash));
+		}
+		let send = lightning_payment(PaymentType::Send, PaymentStatus::Completed, hash);
+		assert!(!is_lightning_receive_for_hash(&send, &hash));
+		let other = lightning_payment(PaymentType::Receive, PaymentStatus::Completed, [0x44; 32]);
+		assert!(!is_lightning_receive_for_hash(&other, &hash));
 	}
 }

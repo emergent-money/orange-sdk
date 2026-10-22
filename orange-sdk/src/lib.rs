@@ -8,7 +8,9 @@ pub use bitcoin_payment_instructions::PaymentMethod;
 use bitcoin_payment_instructions::amount::Amount;
 
 use crate::rebalancer::{OrangeRebalanceEventHandler, OrangeTrigger};
-use crate::store::{MppLegKind, MppMerge, TxMetadata, TxMetadataStore, TxType};
+use crate::store::{
+	MppLegKind, MppMerge, TxMetadata, TxMetadataStore, TxType, WrappedReceiveEntry,
+};
 #[cfg(feature = "cashu")]
 use crate::trusted_wallet::cashu::Cashu;
 #[cfg(feature = "_test-utils")]
@@ -18,15 +20,16 @@ use crate::trusted_wallet::spark::Spark;
 use crate::trusted_wallet::{DynTrustedWalletInterface, WalletTrusted};
 use graduated_rebalancer::GraduatedRebalancer;
 use ldk_node::bitcoin::Network;
-use ldk_node::bitcoin::hashes::Hash;
+use ldk_node::bitcoin::hashes::{Hash, sha256};
 use ldk_node::bitcoin::io;
-use ldk_node::bitcoin::secp256k1::PublicKey;
+use ldk_node::bitcoin::secp256k1::{PublicKey, SecretKey, rand};
 use ldk_node::entropy::NodeEntropy;
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info, log_trace, log_warn};
 use ldk_node::lightning_invoice::Bolt11Invoice;
+use ldk_node::lightning_types::payment::PaymentHash;
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind};
 use ldk_node::{BuildError, ChannelDetails, NodeError};
 
@@ -36,6 +39,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::sync::watch;
 
 mod dyn_store;
 mod event;
@@ -587,6 +591,37 @@ impl fmt::Display for SingleUseReceiveUri {
 	}
 }
 
+/// A single receive payable over two legs that share one payment hash, as returned by
+/// [`Wallet::get_wrapped_receive`].
+///
+/// A third party (typically the wallet's LSP) holding an outer invoice for the same payment hash
+/// pays exactly one leg, learning the preimage only by doing so: the Lightning leg when this node
+/// can take the payment, or the trusted leg otherwise, which settles without this node being
+/// online.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedReceive {
+	/// The payment hash shared by both invoices.
+	pub payment_hash: PaymentHash,
+	/// Invoice on this node for `payment_hash`; `None` when the node cannot receive the
+	/// amount over its existing inbound capacity (the LSP then uses the trusted leg).
+	pub lightning_invoice: Option<Bolt11Invoice>,
+	/// Trusted-tier invoice for the same hash, settling without this node.
+	pub trusted_invoice: Bolt11Invoice,
+}
+
+/// Draws a fresh preimage for a wrapped receive: 32 random bytes that form a valid secp256k1
+/// scalar, as the trusted wallet's own signer would draw one. Returns the entry holding it along
+/// with its payment hash.
+fn new_wrapped_receive(
+	amount_msat: u64, created_at_secs: u64,
+) -> (WrappedReceiveEntry, PaymentHash) {
+	let mut key = SecretKey::new(&mut rand::thread_rng());
+	let entry = WrappedReceiveEntry { preimage: key.secret_bytes(), created_at_secs, amount_msat };
+	key.non_secure_erase();
+	let payment_hash = PaymentHash(sha256::Hash::hash(&entry.preimage).to_byte_array());
+	(entry, payment_hash)
+}
+
 impl Wallet {
 	/// Constructs a new Wallet
 	///
@@ -639,6 +674,17 @@ impl Wallet {
 		};
 
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+
+		let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+		match store::prune_wrapped_receives(Arc::clone(&store), now).await {
+			Ok(0) => {},
+			Ok(pruned) => log_info!(logger, "Pruned {pruned} expired wrapped receive(s)"),
+			Err(e) => log_error!(logger, "Failed to prune expired wrapped receives: {e}"),
+		}
+
+		// The lightning wallet's event handler needs the trusted wallet to retire wrapped receives,
+		// but both are initialized concurrently, so it is handed over once both are ready.
+		let (trusted_sender, trusted_handle) = watch::channel(None);
 
 		let event_queue =
 			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
@@ -705,6 +751,7 @@ impl Wallet {
 						Arc::clone(&store),
 						Arc::clone(&event_queue),
 						tx_metadata.clone(),
+						trusted_handle,
 						Arc::clone(&logger),
 					)
 					.await?,
@@ -713,6 +760,7 @@ impl Wallet {
 		);
 		let trusted = trusted?;
 		let ln_wallet = ln_wallet?;
+		trusted_sender.send_replace(Some(Arc::clone(&trusted)));
 
 		let wt = Arc::new(WalletTrusted(Arc::clone(&trusted)));
 
@@ -1209,6 +1257,55 @@ impl Wallet {
 		} else {
 			Ok(SingleUseReceiveUri { address: None, invoice: bolt11, amount, from_trusted })
 		}
+	}
+
+	/// Creates a [`WrappedReceive`] for `amount`: a trusted-wallet invoice and, if this node can
+	/// receive `amount` over its existing channels, an invoice on this node, both for the same
+	/// freshly drawn payment hash.
+	///
+	/// The preimage never leaves the wallet except to the trusted wallet, which needs it to settle
+	/// its leg on its own. It is persisted before this returns and used to claim the Lightning leg
+	/// when that is paid, unless the trusted leg has been paid already. A payment to the Lightning
+	/// leg is failed back if it is short of `amount`.
+	///
+	/// `amount` must be a non-zero whole number of sats, and the trusted wallet must support
+	/// invoices for a caller-supplied preimage (currently only Spark does). This does not consider
+	/// [`Tunables`]: the caller decides when to use it instead of
+	/// [`Self::get_single_use_receive_uri`].
+	///
+	/// # Errors
+	///
+	/// - [`WalletError::LdkNodeFailure`] with [`NodeError::InvalidAmount`] for a zero `amount`,
+	///   with [`NodeError::PersistenceFailed`] if the preimage could not be persisted, or with the
+	///   node's error if it failed to create its invoice.
+	/// - [`WalletError::TrustedFailure`] if the trusted wallet failed to create its invoice,
+	///   including [`TrustedError::UnsupportedOperation`] for an unsupported trusted wallet or
+	///   msat `amount`.
+	pub async fn get_wrapped_receive(&self, amount: Amount) -> Result<WrappedReceive, WalletError> {
+		if amount == Amount::ZERO {
+			return Err(WalletError::LdkNodeFailure(NodeError::InvalidAmount));
+		}
+
+		let created_at_secs =
+			SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+		let (entry, payment_hash) = new_wrapped_receive(amount.milli_sats(), created_at_secs);
+
+		let trusted_invoice =
+			self.inner.trusted.get_bolt11_invoice_with_preimage(amount, entry.preimage).await?;
+		let lightning_invoice =
+			self.inner.ln_wallet.get_bolt11_invoice_for_hash(amount, payment_hash).await?;
+
+		store::write_wrapped_receive(self.inner.store.as_ref(), &payment_hash, &entry)
+			.await
+			.map_err(|e| {
+				log_error!(
+					self.inner.logger,
+					"Failed to persist wrapped receive {payment_hash}: {e}"
+				);
+				WalletError::LdkNodeFailure(NodeError::PersistenceFailed)
+			})?;
+
+		Ok(WrappedReceive { payment_hash, lightning_invoice, trusted_invoice })
 	}
 
 	/// Parses payment instructions from an arbitrary string provided by a user, scanned from a QR
@@ -1751,6 +1848,19 @@ mod tests {
 	use ldk_node::lightning::ln::channelmanager::PaymentId as LightningPaymentId;
 	use ldk_node::lightning::types::payment::PaymentHash;
 	use ldk_node::payment::{ConfirmationStatus, PaymentStatus};
+
+	#[test]
+	fn wrapped_receive_preimage_is_a_scalar_hashing_to_the_payment_hash() {
+		let (entry, payment_hash) = new_wrapped_receive(21_000, 1_700_000_000);
+		assert_eq!(payment_hash.0, sha256::Hash::hash(&entry.preimage).to_byte_array());
+		assert!(SecretKey::from_slice(&entry.preimage).is_ok());
+		assert_eq!(entry.amount_msat, 21_000);
+		assert_eq!(entry.created_at_secs, 1_700_000_000);
+
+		let (other, other_hash) = new_wrapped_receive(21_000, 1_700_000_000);
+		assert_ne!(other.preimage, entry.preimage);
+		assert_ne!(other_hash, payment_hash);
+	}
 
 	#[test]
 	fn seed_debug_redacts_seed64_bytes() {

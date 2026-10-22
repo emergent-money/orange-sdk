@@ -173,6 +173,16 @@ impl TrustedWalletInterface for Cashu {
 		})
 	}
 
+	fn get_bolt11_invoice_with_preimage(
+		&self, _amount: Amount, _preimage: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>> {
+		Box::pin(async move {
+			Err(TrustedError::UnsupportedOperation(
+				"Cashu does not support invoices for a caller-supplied preimage".to_owned(),
+			))
+		})
+	}
+
 	fn list_payments(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<Payment>, TrustedError>> + Send + '_>> {
@@ -987,5 +997,67 @@ fn convert_amount(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<Amount, 
 		unit => {
 			Err(TrustedError::Other(format!("Unsupported currency unit {unit} for Cashu wallet")))
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::logging::LoggerType;
+	use crate::{ChainSource, ExtraConfig, StorageConfig, Tunables};
+	use ldk_node::bitcoin::Network;
+	use ldk_node::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+	use ldk_node::io::sqlite_store::SqliteStore;
+	use ldk_node::lightning::ln::msgs::SocketAddress;
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	// Initializing a Cashu wallet does not wait on the mint (only background tasks contact it), so
+	// an unreachable mint URL is enough to build one.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn caller_preimage_invoices_are_unsupported() {
+		let path = std::env::temp_dir().join(format!(
+			"orange-sdk-cashu-preimage-test-{}",
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
+		let store: Arc<dyn DynStore> = Arc::new(
+			SqliteStore::new(path.clone(), Some("orange.sqlite".to_string()), None).unwrap(),
+		);
+		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).unwrap());
+		let runtime = Arc::new(Runtime::new(Arc::clone(&logger)).unwrap());
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let event_queue =
+			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
+		let cashu_config = CashuConfig {
+			mint_url: "http://127.0.0.1:1".to_owned(),
+			unit: CurrencyUnit::Sat,
+			npubcash_url: None,
+		};
+		let lsp_key = SecretKey::from_slice(&[1; 32]).unwrap();
+		let config = WalletConfig {
+			storage_config: StorageConfig::LocalSQLite(path.to_string_lossy().into_owned()),
+			logger_type: LoggerType::LogFacade,
+			chain_source: ChainSource::Electrum("tcp://127.0.0.1:1".to_owned()),
+			lsp: (
+				SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 1 },
+				PublicKey::from_secret_key(&Secp256k1::new(), &lsp_key),
+				None,
+			),
+			scorer_url: None,
+			rgs_url: None,
+			network: Network::Regtest,
+			seed: Seed::Seed64([7; 64]),
+			tunables: Tunables::default(),
+			extra_config: ExtraConfig::Cashu(cashu_config.clone()),
+		};
+		let cashu =
+			Cashu::init(&config, cashu_config, store, event_queue, tx_metadata, logger, runtime)
+				.await
+				.expect("Cashu wallet should initialize without reaching the mint");
+
+		let res = cashu
+			.get_bolt11_invoice_with_preimage(Amount::from_sats(1_000).unwrap(), [0x11; 32])
+			.await;
+		assert!(matches!(res, Err(TrustedError::UnsupportedOperation(_))));
+		assert!(!cashu.has_lightning_receive_for_hash([0x22; 32]).await.unwrap());
 	}
 }

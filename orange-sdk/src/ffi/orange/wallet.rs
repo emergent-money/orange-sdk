@@ -2,6 +2,7 @@ use crate::Balances as OrangeBalances;
 use crate::SingleUseReceiveUri as OrangeSingleUseReceiveUri;
 use crate::Wallet as OrangeWallet;
 use crate::WalletConfig as OrangeWalletConfig;
+use crate::WrappedReceive as OrangeWrappedReceive;
 use crate::ffi::bitcoin_payment_instructions::{
 	Amount, ParseError, PaymentInfo, PaymentInstructions,
 };
@@ -87,6 +88,28 @@ impl SingleUseReceiveUri {
 
 impl_from_core_type!(OrangeSingleUseReceiveUri, SingleUseReceiveUri);
 impl_into_core_type!(SingleUseReceiveUri, OrangeSingleUseReceiveUri);
+
+/// A single receive payable over two legs that share one payment hash: a Lightning invoice on
+/// this node and a trusted-wallet invoice that settles without it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WrappedReceive {
+	/// The payment hash shared by both invoices, hex-encoded.
+	pub payment_hash: String,
+	/// The BOLT 11 invoice on this node, if it can receive the amount over its existing channels.
+	pub lightning_invoice: Option<String>,
+	/// The BOLT 11 trusted-wallet invoice for the same payment hash.
+	pub trusted_invoice: String,
+}
+
+impl From<OrangeWrappedReceive> for WrappedReceive {
+	fn from(receive: OrangeWrappedReceive) -> Self {
+		WrappedReceive {
+			payment_hash: receive.payment_hash.to_string(),
+			lightning_invoice: receive.lightning_invoice.map(|i| i.to_string()),
+			trusted_invoice: receive.trusted_invoice.to_string(),
+		}
+	}
+}
 
 // This is basically the `async-compat` utility that UniFFI uses under
 // the hood for its `async_runtime = "tokio"` attribute, except it lets
@@ -228,6 +251,17 @@ impl Wallet {
 		)
 		.await?;
 		Ok(uri.into())
+	}
+
+	/// Creates a wrapped receive for the given amount: a trusted-wallet invoice and, if this node
+	/// can receive the amount over its existing channels, an invoice on this node, both for the
+	/// same payment hash. See [`crate::Wallet::get_wrapped_receive`].
+	pub async fn get_wrapped_receive(
+		&self, amount: Arc<Amount>,
+	) -> Result<WrappedReceive, WalletError> {
+		let receive =
+			RTPoller::new(self.inner.get_wrapped_receive(amount.0), Arc::clone(&self.rt)).await?;
+		Ok(receive.into())
 	}
 
 	/// List our current channels

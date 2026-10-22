@@ -61,6 +61,39 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 		&self, amount: Option<Amount>,
 	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>>;
 
+	/// Generates a Bolt11 invoice for the specified amount whose payment hash is the SHA-256 of
+	/// the given `preimage`.
+	///
+	/// Like an invoice from [`get_bolt11_invoice`], it settles without any further action from
+	/// this wallet. The caller picks the preimage so that it can also claim a payment for the same
+	/// hash elsewhere, as [`Wallet::get_wrapped_receive`] does. Implementations must return an
+	/// error rather than an invoice for any other payment hash.
+	///
+	/// Implementations that cannot create an invoice for a caller-supplied preimage return
+	/// [`TrustedError::UnsupportedOperation`].
+	///
+	/// [`get_bolt11_invoice`]: Self::get_bolt11_invoice
+	/// [`Wallet::get_wrapped_receive`]: crate::Wallet::get_wrapped_receive
+	fn get_bolt11_invoice_with_preimage(
+		&self, amount: Amount, preimage: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, TrustedError>> + Send + '_>>;
+
+	/// Returns whether this wallet holds an incoming Lightning payment, in any state, for the
+	/// given payment hash.
+	///
+	/// This is used to retire the self-custodial leg of a [`Wallet::get_wrapped_receive`] once its
+	/// trusted leg has been paid. Implementations that cannot create the trusted leg (see
+	/// [`get_bolt11_invoice_with_preimage`]) never hold one, which is what the default
+	/// implementation reports.
+	///
+	/// [`Wallet::get_wrapped_receive`]: crate::Wallet::get_wrapped_receive
+	/// [`get_bolt11_invoice_with_preimage`]: Self::get_bolt11_invoice_with_preimage
+	fn has_lightning_receive_for_hash(
+		&self, _payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = Result<bool, TrustedError>> + Send + '_>> {
+		Box::pin(async move { Ok(false) })
+	}
+
 	/// Lists all payments made through the wallet.
 	fn list_payments(
 		&self,

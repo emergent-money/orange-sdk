@@ -1,7 +1,7 @@
 use crate::bitcoin::OutPoint;
 use crate::bitcoin::hashes::Hash;
 use crate::dyn_store::{DynStore, LdkNodeStore};
-use crate::event::{EventQueue, LdkEventHandler};
+use crate::event::{EventQueue, LdkEventHandler, TrustedWalletHandle};
 use crate::logging::Logger;
 use crate::runtime::Runtime;
 use crate::store::{TxMetadataStore, TxStatus};
@@ -21,6 +21,7 @@ use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::{log_debug, log_error, log_info};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use ldk_node::lightning_types::payment::PaymentHash;
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 };
@@ -61,11 +62,20 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 impl LightningWallet {
 	pub(super) async fn init(
 		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn DynStore>,
-		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, trusted: TrustedWalletHandle,
+		logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		let handle = runtime.get_handle();
 		handle
-			.spawn(Self::init_inner(runtime, config, store, event_queue, tx_metadata, logger))
+			.spawn(Self::init_inner(
+				runtime,
+				config,
+				store,
+				event_queue,
+				tx_metadata,
+				trusted,
+				logger,
+			))
 			.await
 			.map_err(|e| {
 				io::Error::new(io::ErrorKind::Other, format!("LDK initialization task failed: {e}"))
@@ -74,7 +84,8 @@ impl LightningWallet {
 
 	async fn init_inner(
 		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn DynStore>,
-		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
+		event_queue: Arc<EventQueue>, tx_metadata: TxMetadataStore, trusted: TrustedWalletHandle,
+		logger: Arc<Logger>,
 	) -> Result<Self, InitFailure> {
 		log_info!(logger, "Creating LDK node...");
 		let anchor_channels_config = ldk_node::config::AnchorChannelsConfig {
@@ -199,6 +210,8 @@ impl LightningWallet {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
 			tx_metadata,
+			store: Arc::clone(&store),
+			trusted,
 			payment_receipt_sender,
 			channel_pending_sender,
 			splice_pending_inbox: Arc::clone(&splice_pending_inbox),
@@ -281,6 +294,27 @@ impl LightningWallet {
 				None,
 			)
 		}
+	}
+
+	/// Returns an invoice on this node for `payment_hash`, to be claimed manually once the payment
+	/// arrives (see [`ldk_node::payment::Bolt11Payment::receive_for_hash`]), or `None` if `amount`
+	/// exceeds what we can receive over our existing channels.
+	///
+	/// Unlike [`Self::get_bolt11_invoice`] this never requests a JIT channel: the payer of this
+	/// invoice is expected to be the LSP itself, which cannot pay an invoice whose route hint is its
+	/// own JIT-channel intercept.
+	pub(crate) async fn get_bolt11_invoice_for_hash(
+		&self, amount: Amount, payment_hash: PaymentHash,
+	) -> Result<Option<Bolt11Invoice>, NodeError> {
+		if self.estimate_receivable_balance() < amount {
+			return Ok(None);
+		}
+		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
+		self.inner
+			.ldk_node
+			.bolt11_payment()
+			.receive_for_hash(amount.milli_sats(), &desc, DEFAULT_INVOICE_EXPIRY_SECS, payment_hash)
+			.map(Some)
 	}
 
 	pub(crate) fn list_payments(&self) -> Vec<PaymentDetails> {
