@@ -374,7 +374,7 @@ impl LightningWallet {
 			&& is_inbound_bolt11_for(&payment, payment_hash)
 			&& payment.status == PaymentStatus::Succeeded
 		{
-			return Ok(InboundReceipt::Received(payment));
+			return Ok(InboundReceipt::Received(Box::new(payment)));
 		}
 
 		let mut search = InboundReceiptSearch::default();
@@ -383,7 +383,7 @@ impl LightningWallet {
 			let page = self.inner.ldk_node.list_payments(page_token)?;
 			for payment in page.payments {
 				if let Some(received) = search.observe(payment, payment_hash) {
-					return Ok(InboundReceipt::Received(received));
+					return Ok(InboundReceipt::Received(Box::new(received)));
 				}
 			}
 			match page.next_page_token {
@@ -894,7 +894,7 @@ async fn await_inbound_receipt<W: ReceiptWatch>(
 	let mut consecutive_errors = 0;
 	loop {
 		let last_error = match watch.look() {
-			Ok(InboundReceipt::Received(payment)) => return Some(payment),
+			Ok(InboundReceipt::Received(payment)) => return Some(*payment),
 			Ok(InboundReceipt::Failed) => return None,
 			Ok(InboundReceipt::NotYet) => {
 				consecutive_errors = 0;
@@ -984,7 +984,7 @@ impl InboundPaymentIds {
 /// Whether an inbound BOLT 11 payment has been received, as far as the payment store says.
 enum InboundReceipt {
 	/// The payment was received.
-	Received(PaymentDetails),
+	Received(Box<PaymentDetails>),
 	/// Every inbound payment for the hash was failed back, and none was received.
 	Failed,
 	/// Nothing for the hash has arrived yet, or it is still pending.
@@ -1258,12 +1258,12 @@ mod tests {
 	}
 
 	fn received() -> Result<InboundReceipt, NodeError> {
-		Ok(InboundReceipt::Received(payment(
+		Ok(InboundReceipt::Received(Box::new(payment(
 			[0x33; 32],
 			bolt11(HASH, None),
 			PaymentDirection::Inbound,
 			PaymentStatus::Succeeded,
-		)))
+		))))
 	}
 
 	fn not_yet() -> Result<InboundReceipt, NodeError> {
