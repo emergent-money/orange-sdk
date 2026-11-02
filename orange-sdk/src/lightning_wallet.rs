@@ -71,7 +71,8 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 /// most 26 h. LDK measures its own acceptance window from block-header time, which may lead the
 /// wall clock by up to 2 h, so a payment could still be accepted up to 2 h after that. A failure
 /// the trusted wallet reports releases the rebalancer within seconds plus the trusted-failure
-/// receipt grace.
+/// receipt grace, also when the trusted wallet then never reports an outcome (Cashu, for a failed
+/// melt).
 const REBALANCE_INVOICE_EXPIRY_SECS: u32 = 86_400;
 
 impl LightningWallet {

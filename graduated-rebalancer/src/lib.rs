@@ -35,8 +35,9 @@ fn duration_to_millis(duration: Duration) -> u64 {
 /// up to two hours, so a payment could still be accepted that long after the wait has ended.
 ///
 /// With orange-sdk's 24 h rebalance invoices, a rebalance whose failure goes undetected holds the
-/// rebalancer for at most 26 h; one the trusted wallet reports failed, for seconds plus
-/// [`RebalanceTunables::trusted_failure_receipt_grace`].
+/// rebalancer for at most 26 h. One the trusted wallet reports failed holds it for seconds plus
+/// [`RebalanceTunables::trusted_failure_receipt_grace`], whether or not a receipt then lands and
+/// whether or not the trusted wallet ever reports an outcome (Cashu does not, for a failed melt).
 pub const RECEIPT_DEADLINE_GRACE: Duration = Duration::from_secs(7_200);
 
 /// When the rebalancer stops waiting for the payment to `invoice` to be received: the invoice's
@@ -423,6 +424,10 @@ where
 					let mut receipt =
 						self.ln_wallet.await_payment_receipt(expected_hash.0, receipt_deadline);
 					let trusted_failure = self.trusted.await_payment_failure(expected_hash.0);
+					// How long to wait for the trusted side's verdict once the receipt is in
+					// hand: to the receipt's deadline, or to the end of the grace if the trusted
+					// side already reported a failure.
+					let mut verdict_deadline = deadline;
 					let receipt = tokio::select! {
 						biased;
 						receipt = &mut receipt => receipt,
@@ -432,11 +437,13 @@ where
 							let grace = Duration::from_millis(
 								self.trusted_failure_receipt_grace_ms.load(Ordering::Relaxed),
 							);
-							log_warn!(
+														log_warn!(
 								self.logger,
 								"Rebalance payment failed on the trusted side; waiting up to {grace:?} for a Lightning receipt in case it was received anyway"
 							);
-							match tokio::time::timeout(grace, &mut receipt).await {
+							let grace_end = tokio::time::Instant::now() + grace;
+							verdict_deadline = grace_end.min(deadline);
+							match tokio::time::timeout_at(grace_end, &mut receipt).await {
 								Ok(Some(receipt)) => {
 									log_warn!(
 										self.logger,
@@ -462,16 +469,19 @@ where
 						},
 					};
 
-					// The receipt is in hand: our node was paid, so the rebalance is complete
-					// whatever the trusted side says now, and its verdict only supplies the
-					// trusted fee. That verdict can be wrong or never come: Breez can list a
-					// Spark send as failed after our node released the preimage (and never turns
-					// a failed payment into a completed one), and a Cashu wallet waits for an
-					// outgoing transaction that a failed melt never creates. So the wait is
-					// bounded by the receipt's deadline, and without a verdict the rebalance is
-					// recorded with the trusted fee unknown.
+					// The receipt is in hand: our node was paid, so we record the rebalance, and the
+					// trusted side's verdict only supplies its fee. That verdict can be wrong or
+					// never come: Breez can list a Spark send as failed after our node released
+					// the preimage (and never turns a failed payment into a completed one), and a
+					// Cashu wallet waits for an outgoing transaction that a failed melt never
+					// creates. Where a reported failure is accurate (Breez returned the leaves to
+					// us), history then shows a transfer without a trusted debit; the next listing
+					// of the trusted balance still gets balances right. That beats waiting on the
+					// verdict for good, as before. So the wait is bounded, by the rest of the grace
+					// once a failure was reported and by the receipt's deadline otherwise, and
+					// without a verdict the rebalance is recorded with the trusted fee unknown.
 					let trusted_fee_msat = match tokio::time::timeout_at(
-						deadline,
+						verdict_deadline,
 						self.trusted.await_payment_success(expected_hash.0),
 					)
 					.await
@@ -487,7 +497,7 @@ where
 						Err(_) => {
 							log_warn!(
 								self.logger,
-								"Rebalance payment was received by our node, but the trusted side reported no outcome by the deadline; recording the rebalance with the trusted fee unknown"
+																"Rebalance payment was received by our node, but the trusted side reported no outcome in time; recording the rebalance with the trusted fee unknown"
 							);
 							None
 						},
@@ -824,15 +834,22 @@ mod tests {
 		assert_eq!(rebalance(failure, Some(secs(62)), Verdict::Failed).await, (secs(61), None));
 	}
 
-	/// Cashu: the failed-melt signal fires, the receipt lands within the grace, and the trusted
-	/// side never reports an outcome (it waits for a transaction the failed melt never created).
-	/// The rebalance is recorded at the receipt deadline, with the trusted fee unknown.
+	/// Cashu: the failed-melt signal fires at 1 s, the receipt lands within the grace, and the
+	/// trusted side never reports an outcome (it waits for a transaction the failed melt never
+	/// created). The rebalance is recorded, with the trusted fee unknown, once the grace is over,
+	/// not at the receipt deadline 26 h on.
 	#[tokio::test(start_paused = true)]
-	async fn a_receipt_after_a_failed_melt_is_recorded_at_the_deadline() {
+	async fn a_receipt_after_a_failed_melt_is_recorded_once_the_grace_is_over() {
 		let secs = Duration::from_secs;
-		let (elapsed, fee) = rebalance(Some(secs(1)), Some(secs(30)), Verdict::Never).await;
-		assert_eq!(fee, Some(1_000));
-		assert_ended_at_the_deadline(elapsed);
+		assert_eq!(
+			rebalance(Some(secs(1)), Some(secs(30)), Verdict::Never).await,
+			(secs(61), Some(1_000))
+		);
+		// The same with the receipt in the grace's last second.
+		assert_eq!(
+			rebalance(Some(secs(1)), Some(secs(60)), Verdict::Never).await,
+			(secs(61), Some(1_000))
+		);
 	}
 
 	/// Without a trusted failure the receipt completes the rebalance, however long it takes, and
