@@ -3027,8 +3027,10 @@ async fn test_failed_trusted_rebalance_payment_releases_the_rebalancer() {
 		}
 		let retried_at = retried_at.expect("the retry started");
 		info!("the next rebalance started {retried_at:?} after the failed one");
+		// Seconds, against the 26 h the rebalancer would otherwise hold on (1.25 s when idle); the
+		// bound leaves room for a loaded machine.
 		assert!(
-			retried_at < Duration::from_secs(10),
+			retried_at < Duration::from_secs(30),
 			"the failed rebalance held on for {retried_at:?}"
 		);
 	})
