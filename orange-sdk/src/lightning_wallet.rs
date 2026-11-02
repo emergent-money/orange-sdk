@@ -49,6 +49,7 @@ pub(crate) struct LightningWalletImpl {
 	payment_receipt_flag: watch::Receiver<()>,
 	channel_pending_receipt_flag: watch::Receiver<u128>,
 	splice_pending_inbox: Arc<SplicePendingInbox>,
+	inbound_payment_ids: Arc<InboundPaymentIds>,
 	lsp_node_id: PublicKey,
 	lsp_socket_addr: SocketAddress,
 }
@@ -95,16 +96,17 @@ impl LightningWallet {
 		};
 		let ldk_node_config = ldk_node::config::Config {
 			anchor_channels_config,
-			// The Lightning leg of a wrapped receive is a `receive_for_hash` invoice whose preimage
-			// orange-sdk holds, not ldk-node. Since lightningdevkit/ldk-node#948 creating such an
-			// invoice no longer stores a payment record, so when it is paid ldk-node knows neither the
-			// payment nor its preimage, and with this flag off it fails the HTLCs back on arrival
-			// without emitting `Event::PaymentClaimable`: every Lightning leg would be refused. With
-			// it on, ldk-node records the payment and emits the event, and `LdkEventHandler` claims
-			// it (only a known wrapped receive, for at least its amount, whose trusted leg is unpaid)
-			// or fails it back at once. Failing back at once also bounds ldk-node's warning about
-			// this flag: a payer holding one of our invoices cannot keep HTLC slots held for longer
-			// than it takes us to handle the event.
+			// The Lightning leg of a wrapped receive is a `receive_for_hash` invoice whose
+			// preimage orange-sdk holds, not ldk-node. Since lightningdevkit/ldk-node#948
+			// creating such an invoice no longer stores a payment record, so when it is paid
+			// ldk-node knows neither the payment nor its preimage, and with this flag off it
+			// fails the HTLCs back on arrival without emitting `Event::PaymentClaimable`: every
+			// Lightning leg would be refused. With it on, ldk-node records the payment and emits
+			// the event, and `LdkEventHandler` claims it (only a known wrapped receive, for at
+			// least its amount, whose trusted leg is unpaid) or fails it back at once. Failing
+			// back at once also bounds ldk-node's warning about this flag: a payer holding one
+			// of our invoices cannot keep HTLC slots held for longer than it takes us to handle
+			// the event.
 			manually_handle_unknown_bolt11_payments: true,
 			..Default::default()
 		};
@@ -221,6 +223,7 @@ impl LightningWallet {
 			pending: Mutex::new(HashMap::new()),
 			notify: Notify::new(),
 		});
+		let inbound_payment_ids = Arc::new(InboundPaymentIds::default());
 		let ev_handler = Arc::new(LdkEventHandler {
 			event_queue,
 			ldk_node: Arc::clone(&ldk_node),
@@ -230,6 +233,7 @@ impl LightningWallet {
 			payment_receipt_sender,
 			channel_pending_sender,
 			splice_pending_inbox: Arc::clone(&splice_pending_inbox),
+			inbound_payment_ids: Arc::clone(&inbound_payment_ids),
 			logger: Arc::clone(&logger),
 		});
 		let inner = Arc::new(LightningWalletImpl {
@@ -239,6 +243,7 @@ impl LightningWallet {
 			payment_receipt_flag,
 			channel_pending_receipt_flag,
 			splice_pending_inbox,
+			inbound_payment_ids,
 			lsp_node_id,
 			lsp_socket_addr,
 		});
@@ -254,12 +259,6 @@ impl LightningWallet {
 		});
 
 		Ok(Self { inner })
-	}
-
-	pub(crate) async fn await_payment_receipt(&self) {
-		let mut flag = self.inner.payment_receipt_flag.clone();
-		flag.mark_unchanged();
-		let _ = flag.changed().await;
 	}
 
 	pub(crate) async fn await_channel_pending(&self, channel_id: u128) {
@@ -330,6 +329,40 @@ impl LightningWallet {
 			.bolt11_payment()
 			.receive_for_hash(amount.milli_sats(), &desc, DEFAULT_INVOICE_EXPIRY_SECS, payment_hash)
 			.map(Some)
+	}
+
+	/// Looks up whether the inbound BOLT 11 payment for `payment_hash` has been received.
+	///
+	/// Since lightningdevkit/ldk-node#948 an inbound payment's record is created only when its
+	/// HTLCs arrive, under the id LDK derives from them, so it can no longer be found as
+	/// `PaymentId(payment_hash)`. We first try the id the event handler saw for this hash;
+	/// failing that (the event has not been handled yet, or was handled before a restart) we
+	/// search the payment store, newest first, stopping at the first received payment.
+	fn inbound_receipt(&self, payment_hash: PaymentHash) -> Result<InboundReceipt, NodeError> {
+		if let Some(id) = self.inner.inbound_payment_ids.get(&payment_hash) {
+			if let Some(payment) = self.inner.ldk_node.payment(&id)? {
+				if is_inbound_bolt11_for(&payment, payment_hash)
+					&& payment.status == PaymentStatus::Succeeded
+				{
+					return Ok(InboundReceipt::Received(payment));
+				}
+			}
+		}
+
+		let mut search = InboundReceiptSearch::default();
+		let mut page_token = None;
+		loop {
+			let page = self.inner.ldk_node.list_payments(page_token)?;
+			for payment in page.payments {
+				if let Some(received) = search.observe(payment, payment_hash) {
+					return Ok(InboundReceipt::Received(received));
+				}
+			}
+			match page.next_page_token {
+				Some(token) => page_token = Some(token),
+				None => return Ok(search.outcome()),
+			}
+		}
 	}
 
 	/// Lists every payment in the node's payment store, newest first, walking all its pages.
@@ -560,38 +593,38 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
-			let id = PaymentId(payment_hash);
+			let payment_hash = PaymentHash(payment_hash);
+			let mut flag = self.inner.payment_receipt_flag.clone();
 			loop {
-				let payment = match self.inner.ldk_node.payment(&id) {
-					Ok(payment) => payment,
+				// Mark the flag seen before looking, not after: a receipt handled while we look
+				// then wakes the wait below instead of being missed.
+				flag.mark_unchanged();
+				match self.inbound_receipt(payment_hash) {
+					Ok(InboundReceipt::Received(payment)) => {
+						let fee_paid_msat = match payment.kind {
+							PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } => {
+								counterparty_skimmed_fee_msat
+							},
+							_ => None,
+						};
+						// The id ldk-node stored the payment under, which `list_transactions` and
+						// the rebalance metadata key on; it is not the payment hash.
+						return Some(ReceivedLightningPayment { id: payment.id.0, fee_paid_msat });
+					},
+					Ok(InboundReceipt::Failed) => return None,
+					Ok(InboundReceipt::NotYet) => {},
 					Err(e) => {
 						log_error!(
 							self.inner.logger,
-							"Failed to read rebalance payment {id} while waiting for it: {e}"
+							"Failed to look up the payment for hash {payment_hash} while waiting for it: {e}"
 						);
 						return None;
 					},
-				};
-				if let Some(payment) = payment {
-					let counterparty_skimmed_fee_msat = match payment.kind {
-						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
-							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");
-							counterparty_skimmed_fee_msat
-						},
-						_ => return None, // Ignore other payment kinds, we only care about the one we just sent.
-					};
-					match payment.status {
-						PaymentStatus::Succeeded => {
-							return Some(ReceivedLightningPayment {
-								id: payment.id.0,
-								fee_paid_msat: counterparty_skimmed_fee_msat,
-							});
-						},
-						PaymentStatus::Pending => {},
-						PaymentStatus::Failed => return None,
-					}
 				}
-				self.await_payment_receipt().await;
+				if flag.changed().await.is_err() {
+					// The event handler is gone, so no receipt will be signalled any more.
+					return None;
+				}
 			}
 		})
 	}
@@ -725,6 +758,88 @@ impl SplicePendingInbox {
 	}
 }
 
+/// The payment ids ldk-node reported for inbound payments, keyed by payment hash, as seen by
+/// [`LdkEventHandler`] since start.
+///
+/// An inbound payment's id is derived by LDK from its HTLCs, so the id for a hash is only known
+/// once the payment arrives. Entries are never removed; the map is in memory only and holds one
+/// small entry per inbound payment handled since start.
+#[derive(Default)]
+pub(crate) struct InboundPaymentIds {
+	ids: Mutex<HashMap<PaymentHash, PaymentId>>,
+}
+
+impl InboundPaymentIds {
+	/// Records the id of a payment that has been received (`Event::PaymentReceived`). This wins
+	/// over any id recorded for the hash before.
+	pub(crate) fn record_received(&self, payment_hash: PaymentHash, payment_id: PaymentId) {
+		self.ids.lock().unwrap().insert(payment_hash, payment_id);
+	}
+
+	/// Records the id of a payment that is waiting to be claimed (`Event::PaymentClaimable`),
+	/// unless an id is already known for the hash: a later payment to the same hash, which is
+	/// failed back, must not hide one that was received.
+	pub(crate) fn record_claimable(&self, payment_hash: PaymentHash, payment_id: PaymentId) {
+		self.ids.lock().unwrap().entry(payment_hash).or_insert(payment_id);
+	}
+
+	pub(crate) fn get(&self, payment_hash: &PaymentHash) -> Option<PaymentId> {
+		self.ids.lock().unwrap().get(payment_hash).copied()
+	}
+}
+
+/// Whether an inbound BOLT 11 payment has been received, as far as the payment store says.
+enum InboundReceipt {
+	/// The payment was received.
+	Received(PaymentDetails),
+	/// Every inbound payment for the hash was failed back, and none was received.
+	Failed,
+	/// Nothing for the hash has arrived yet, or it is still pending.
+	NotYet,
+}
+
+fn is_inbound_bolt11_for(payment: &PaymentDetails, payment_hash: PaymentHash) -> bool {
+	payment.direction == PaymentDirection::Inbound
+		&& matches!(payment.kind, PaymentKind::Bolt11 { hash, .. } if hash == payment_hash)
+}
+
+/// Searches payments for a received inbound BOLT 11 payment to a hash. More than one inbound
+/// payment can exist for a hash (a payment failed back and paid again arrives under a new id),
+/// so the payment counts as received if any of them was, and as failed only if all of them were.
+#[derive(Default)]
+struct InboundReceiptSearch {
+	seen: bool,
+	any_not_failed: bool,
+}
+
+impl InboundReceiptSearch {
+	/// Returns `payment` if it is a received inbound BOLT 11 payment for `payment_hash`.
+	fn observe(
+		&mut self, payment: PaymentDetails, payment_hash: PaymentHash,
+	) -> Option<PaymentDetails> {
+		if !is_inbound_bolt11_for(&payment, payment_hash) {
+			return None;
+		}
+		self.seen = true;
+		match payment.status {
+			PaymentStatus::Succeeded => Some(payment),
+			PaymentStatus::Pending => {
+				self.any_not_failed = true;
+				None
+			},
+			PaymentStatus::Failed => None,
+		}
+	}
+
+	fn outcome(self) -> InboundReceipt {
+		if self.seen && !self.any_not_failed {
+			InboundReceipt::Failed
+		} else {
+			InboundReceipt::NotYet
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -752,5 +867,145 @@ mod tests {
 		assert_eq!(queue.pop_front(), Some(first));
 		assert_eq!(queue.pop_front(), Some(second));
 		assert!(queue.is_empty());
+	}
+
+	const HASH: [u8; 32] = [0x11; 32];
+	const OTHER_HASH: [u8; 32] = [0x22; 32];
+
+	fn payment(
+		id: [u8; 32], kind: PaymentKind, direction: PaymentDirection, status: PaymentStatus,
+	) -> PaymentDetails {
+		PaymentDetails {
+			id: PaymentId(id),
+			kind,
+			amount_msat: Some(21_000),
+			fee_paid_msat: None,
+			direction,
+			status,
+			latest_update_timestamp: 1_700_000_000,
+		}
+	}
+
+	fn bolt11(hash: [u8; 32], skimmed_fee_msat: Option<u64>) -> PaymentKind {
+		PaymentKind::Bolt11 {
+			hash: PaymentHash(hash),
+			preimage: None,
+			secret: None,
+			counterparty_skimmed_fee_msat: skimmed_fee_msat,
+		}
+	}
+
+	fn search(payments: Vec<PaymentDetails>) -> (Option<PaymentDetails>, InboundReceipt) {
+		let mut search = InboundReceiptSearch::default();
+		for p in payments {
+			if let Some(received) = search.observe(p, PaymentHash(HASH)) {
+				return (Some(received), InboundReceipt::NotYet);
+			}
+		}
+		(None, search.outcome())
+	}
+
+	/// An inbound payment is stored under the id LDK derives from its HTLCs, so the search must
+	/// match on the payment hash and direction, never on `PaymentId(hash)`.
+	#[test]
+	fn inbound_receipt_search_matches_hash_not_id() {
+		let derived_id = [0x33; 32];
+		let (received, _) = search(vec![
+			// Our own outbound payment to the hash, stored under `PaymentId(hash)` as BOLT 11
+			// sends still are: not a receipt.
+			payment(HASH, bolt11(HASH, None), PaymentDirection::Outbound, PaymentStatus::Succeeded),
+			// A received payment to another hash.
+			payment(
+				[0x44; 32],
+				bolt11(OTHER_HASH, None),
+				PaymentDirection::Inbound,
+				PaymentStatus::Succeeded,
+			),
+			// A keysend that happens to carry the hash: not the invoice payment we wait for.
+			payment(
+				[0x55; 32],
+				PaymentKind::Spontaneous { hash: PaymentHash(HASH), preimage: None },
+				PaymentDirection::Inbound,
+				PaymentStatus::Succeeded,
+			),
+			payment(
+				derived_id,
+				bolt11(HASH, Some(1_000)),
+				PaymentDirection::Inbound,
+				PaymentStatus::Succeeded,
+			),
+		]);
+		let received = received.expect("the inbound BOLT 11 payment is a receipt");
+		assert_eq!(received.id, PaymentId(derived_id));
+		assert_ne!(received.id, PaymentId(HASH));
+	}
+
+	/// A hash paid again after a failed attempt has a failed and a received payment: it counts as
+	/// received, whichever order the store lists them in.
+	#[test]
+	fn inbound_receipt_search_prefers_any_received_payment() {
+		let failed = payment(
+			[0x01; 32],
+			bolt11(HASH, None),
+			PaymentDirection::Inbound,
+			PaymentStatus::Failed,
+		);
+		let received = payment(
+			[0x02; 32],
+			bolt11(HASH, None),
+			PaymentDirection::Inbound,
+			PaymentStatus::Succeeded,
+		);
+		for payments in [vec![failed.clone(), received.clone()], vec![received.clone(), failed]] {
+			let (found, _) = search(payments);
+			assert_eq!(found, Some(received.clone()));
+		}
+	}
+
+	#[test]
+	fn inbound_receipt_search_outcome_without_a_received_payment() {
+		let inbound =
+			|id, status| payment([id; 32], bolt11(HASH, None), PaymentDirection::Inbound, status);
+
+		// Nothing for the hash yet: keep waiting.
+		let (found, outcome) = search(vec![payment(
+			HASH,
+			bolt11(HASH, None),
+			PaymentDirection::Outbound,
+			PaymentStatus::Failed,
+		)]);
+		assert!(found.is_none());
+		assert!(matches!(outcome, InboundReceipt::NotYet));
+
+		// Still pending: keep waiting.
+		let (_, outcome) = search(vec![inbound(1, PaymentStatus::Pending)]);
+		assert!(matches!(outcome, InboundReceipt::NotYet));
+
+		// One failed attempt and one still pending: keep waiting for the pending one.
+		let (_, outcome) =
+			search(vec![inbound(1, PaymentStatus::Failed), inbound(2, PaymentStatus::Pending)]);
+		assert!(matches!(outcome, InboundReceipt::NotYet));
+
+		// Every inbound payment for the hash failed: give up, as for a failed payment before.
+		let (_, outcome) =
+			search(vec![inbound(1, PaymentStatus::Failed), inbound(2, PaymentStatus::Failed)]);
+		assert!(matches!(outcome, InboundReceipt::Failed));
+	}
+
+	#[test]
+	fn inbound_payment_ids_prefer_the_received_payment() {
+		let hash = PaymentHash(HASH);
+		let (first, second) = (PaymentId([0x01; 32]), PaymentId([0x02; 32]));
+
+		let ids = InboundPaymentIds::default();
+		assert_eq!(ids.get(&hash), None);
+		ids.record_claimable(hash, first);
+		assert_eq!(ids.get(&hash), Some(first));
+		// The payment that was received replaces one that was only claimable.
+		ids.record_received(hash, second);
+		assert_eq!(ids.get(&hash), Some(second));
+		// A later claimable payment to the same hash (which is failed back) does not hide it.
+		ids.record_claimable(hash, first);
+		assert_eq!(ids.get(&hash), Some(second));
 	}
 }

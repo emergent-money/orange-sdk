@@ -537,6 +537,7 @@ pub(crate) struct LdkEventHandler {
 	pub(crate) payment_receipt_sender: watch::Sender<()>,
 	pub(crate) channel_pending_sender: watch::Sender<u128>,
 	pub(crate) splice_pending_inbox: Arc<crate::lightning_wallet::SplicePendingInbox>,
+	pub(crate) inbound_payment_ids: Arc<crate::lightning_wallet::InboundPaymentIds>,
 	pub(crate) logger: Arc<Logger>,
 }
 
@@ -591,6 +592,10 @@ impl LdkEventHandler {
 				amount_msat,
 				custom_records,
 			} => {
+				// Inbound ids are derived by LDK from the HTLCs, not the payment hash: remember
+				// this one so `await_payment_receipt` can find the payment by its hash.
+				self.inbound_payment_ids.record_received(payment_hash, payment_id);
+
 				// The fee is informational, so a failed store read must not hold back the event:
 				// it is logged and the event carries no fee.
 				let lsp_fee_msats = match self.ldk_node.payment(&payment_id) {
@@ -637,6 +642,7 @@ impl LdkEventHandler {
 				claimable_amount_msat,
 				..
 			} => {
+				self.inbound_payment_ids.record_claimable(payment_hash, payment_id);
 				self.handle_payment_claimable(payment_id, payment_hash, claimable_amount_msat)
 					.await;
 			},

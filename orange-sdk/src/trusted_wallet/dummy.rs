@@ -516,6 +516,9 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
+			// This waits for our own outbound payment (`pay` sends BOLT 11 invoices with
+			// `send_using_amount`), which ldk-node still stores under `PaymentId(payment_hash)`.
+			// Only inbound payments moved to ids derived from their HTLCs.
 			let id = channelmanager::PaymentId(payment_hash);
 			let mut flag = self.payment_success_flag.clone();
 			flag.mark_unchanged();

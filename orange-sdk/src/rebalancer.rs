@@ -352,6 +352,8 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
 					self.tx_metadata.upsert(PaymentId::Trusted(rebalance_id), metadata).await;
+					// `lightning_id` is the id ldk-node stored the received payment under (derived
+					// from its HTLCs, not the payment hash), as `list_transactions` looks it up.
 					self.tx_metadata.insert(PaymentId::SelfCustodial(lightning_id), metadata).await;
 
 					let event_queue = Arc::clone(&self.event_queue);
