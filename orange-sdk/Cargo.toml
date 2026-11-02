@@ -49,3 +49,5 @@ pin-project-lite = { version = "0.2", default-features = false, optional = true 
 
 [dev-dependencies]
 test-log = "0.2.18"
+# A paused clock for the rebalance-wait timing tests.
+tokio = { version = "1.0", default-features = false, features = ["test-util"] }

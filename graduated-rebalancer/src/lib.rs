@@ -18,6 +18,11 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How long after the expiry of a rebalance invoice the rebalancer still waits for the payment to
+/// it to be received, covering a payment that was in flight when the invoice expired.
+pub const RECEIPT_DEADLINE_GRACE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Parameters for doing a rebalance
@@ -108,8 +113,13 @@ pub trait LightningWallet: Send + Sync {
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], Self::Error>> + Send + '_>>;
 
 	/// Wait for a payment receipt notification
+	///
+	/// Stops waiting at `deadline`, a time since the Unix epoch, and returns `None` if the payment
+	/// has not been received by then. The rebalancer passes the expiry of the invoice it paid plus
+	/// [`RECEIPT_DEADLINE_GRACE`]: a payment that has not arrived by then never will, and the
+	/// implementation may not learn of a refused payment any other way.
 	fn await_payment_receipt(
-		&self, payment_hash: [u8; 32],
+		&self, payment_hash: [u8; 32], deadline: Duration,
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 
 	/// Check if we already have a channel with the LSP
@@ -314,6 +324,10 @@ where
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
 			);
 			let expected_hash = inv.payment_hash();
+			// Without an expiry that fits a `Duration`, wait as long as it takes.
+			let receipt_deadline = inv
+				.expires_at()
+				.map_or(Duration::MAX, |expiry| expiry.saturating_add(RECEIPT_DEADLINE_GRACE));
 			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
 				Ok(rebalance_id) => {
 					log_debug!(
@@ -330,14 +344,17 @@ where
 						})
 						.await;
 
-					let ln_payment =
-						match self.ln_wallet.await_payment_receipt(expected_hash.0).await {
-							Some(receipt) => receipt,
-							None => {
-								log_error!(self.logger, "Failed to receive rebalance payment!");
-								return;
-							},
-						};
+					let ln_payment = match self
+						.ln_wallet
+						.await_payment_receipt(expected_hash.0, receipt_deadline)
+						.await
+					{
+						Some(receipt) => receipt,
+						None => {
+							log_error!(self.logger, "Failed to receive rebalance payment!");
+							return;
+						},
+					};
 
 					let trusted_payment =
 						match self.trusted.await_payment_success(expected_hash.0).await {

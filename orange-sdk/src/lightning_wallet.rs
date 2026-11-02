@@ -35,6 +35,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Notify, watch};
+use tokio::time::Instant;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LightningWalletBalance {
@@ -590,7 +591,7 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 	}
 
 	fn await_payment_receipt(
-		&self, payment_hash: [u8; 32],
+		&self, payment_hash: [u8; 32], deadline: Duration,
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
 			let payment_hash = PaymentHash(payment_hash);
@@ -599,8 +600,10 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 				flag: self.inner.payment_receipt_flag.clone(),
 				payment_hash,
 			};
+			let deadline = instant_at(deadline);
 			let payment =
-				await_inbound_receipt(&mut watch, payment_hash, &self.inner.logger).await?;
+				await_inbound_receipt(&mut watch, payment_hash, deadline, &self.inner.logger)
+					.await?;
 			let fee_paid_msat = match payment.kind {
 				PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } => {
 					counterparty_skimmed_fee_msat
@@ -755,9 +758,22 @@ trait ReceiptWatch {
 	/// receipt signalled during the lookup wakes the next [`Self::wait`] instead of being missed.
 	fn look(&mut self) -> Result<InboundReceipt, NodeError>;
 
-	/// Waits for the next wake-up; after a failed lookup, for at most [`RECEIPT_RETRY_DELAY`].
-	/// Returns `false` once no wake-up can come any more.
-	fn wait(&mut self, after_error: bool) -> impl Future<Output = bool> + Send;
+	/// Waits as [`wait_for_wake_up`] does. Returns `false` once no wake-up can come any more.
+	fn wait(&mut self, after_error: bool, deadline: Instant) -> impl Future<Output = bool> + Send;
+}
+
+/// Waits for the next wake-up on `flag`, but no later than `deadline` and, after a failed lookup,
+/// no longer than [`RECEIPT_RETRY_DELAY`]. Returns `false` if the sender is gone, so no wake-up
+/// can come any more, and `true` otherwise, also when a timer ran out: then the caller looks again.
+async fn wait_for_wake_up(
+	flag: &mut watch::Receiver<()>, after_error: bool, deadline: Instant,
+) -> bool {
+	let until =
+		if after_error { deadline.min(Instant::now() + RECEIPT_RETRY_DELAY) } else { deadline };
+	match tokio::time::timeout_at(until, flag.changed()).await {
+		Ok(changed) => changed.is_ok(),
+		Err(_elapsed) => true,
+	}
 }
 
 /// The rebalance wait of [`LightningWallet`]'s `await_payment_receipt`: wakes on every handled
@@ -776,38 +792,43 @@ impl ReceiptWatch for NodeReceiptWatch<'_> {
 		self.wallet.inbound_receipt(self.payment_hash)
 	}
 
-	async fn wait(&mut self, after_error: bool) -> bool {
-		if after_error {
-			match tokio::time::timeout(RECEIPT_RETRY_DELAY, self.flag.changed()).await {
-				Ok(changed) => changed.is_ok(),
-				// No wake-up in time: look again anyway.
-				Err(_elapsed) => true,
-			}
-		} else {
-			self.flag.changed().await.is_ok()
-		}
+	async fn wait(&mut self, after_error: bool, deadline: Instant) -> bool {
+		wait_for_wake_up(&mut self.flag, after_error, deadline).await
 	}
 }
 
-/// Waits until `watch` reports the payment for `payment_hash` received (`Some`) or failed (`None`),
-/// or no wake-up can come any more (`None`).
+/// The [`Instant`] at `deadline`, a time since the Unix epoch.
+fn instant_at(deadline: Duration) -> Instant {
+	let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+	let remaining = deadline.saturating_sub(now);
+	// A deadline beyond what an `Instant` can hold (`Duration::MAX` for an invoice whose expiry
+	// overflows) is as good as a century away.
+	Instant::now()
+		.checked_add(remaining)
+		.unwrap_or_else(|| Instant::now() + Duration::from_secs(100 * 365 * 24 * 60 * 60))
+}
+
+/// Waits until `watch` reports the payment for `payment_hash` received (`Some`), or failed, or
+/// not received by `deadline`, or no wake-up can come any more (all `None`).
 ///
-/// A failed lookup (a payment-store read can fail since the store became a bounded cache) never
-/// ends the wait: it is logged with a running count and retried on the next wake-up, or after
-/// [`RECEIPT_RETRY_DELAY`] if none comes, for as long as it keeps failing. Giving up would leave
-/// the rebalance unrecorded: its trusted debit hidden as a pending rebalance and its Lightning
-/// receipt shown as ordinary income, so history would overstate income by the rebalance amount.
+/// It looks on every wake-up and once more at the deadline. A failed lookup (a payment-store read
+/// can fail since the store became a bounded cache) does not end the wait: it is logged with a
+/// running count (as a warning from the [`RECEIPT_ERRORS_BEFORE_WARN`]th in a row) and retried
+/// on the next wake-up, or after [`RECEIPT_RETRY_DELAY`] if none comes, until the deadline. The
+/// deadline is what ends a wait for a payment ldk-node refused without recording a failure (an
+/// over-limit LSP skim, say): it is the paid invoice's expiry plus a grace period, after which
+/// that payment can no longer arrive.
 async fn await_inbound_receipt<W: ReceiptWatch>(
-	watch: &mut W, payment_hash: PaymentHash, logger: &Logger,
+	watch: &mut W, payment_hash: PaymentHash, deadline: Instant, logger: &Logger,
 ) -> Option<PaymentDetails> {
 	let mut consecutive_errors = 0;
 	loop {
-		let after_error = match watch.look() {
+		let last_error = match watch.look() {
 			Ok(InboundReceipt::Received(payment)) => return Some(payment),
 			Ok(InboundReceipt::Failed) => return None,
 			Ok(InboundReceipt::NotYet) => {
 				consecutive_errors = 0;
-				false
+				None
 			},
 			Err(e) => {
 				consecutive_errors += 1;
@@ -822,10 +843,23 @@ async fn await_inbound_receipt<W: ReceiptWatch>(
 						"Failed to look up the payment for hash {payment_hash} while waiting for it ({consecutive_errors} in a row), will retry: {e}"
 					);
 				}
-				true
+				Some(e)
 			},
 		};
-		if !watch.wait(after_error).await {
+		if Instant::now() >= deadline {
+			match last_error {
+				None => log_warn!(
+					logger,
+					"Stopped waiting for the payment for hash {payment_hash}: the rebalance invoice expired unpaid"
+				),
+				Some(e) => log_error!(
+					logger,
+					"Stopped waiting for the payment for hash {payment_hash} at the rebalance invoice's expiry: its receipt could not be read ({consecutive_errors} failed lookups in a row, last: {e}). If it did arrive, the rebalance is not recorded as one"
+				),
+			}
+			return None;
+		}
+		if !watch.wait(last_error.is_some(), deadline).await {
 			// The event handler is gone, so no receipt will be signalled any more.
 			return None;
 		}
@@ -1089,44 +1123,52 @@ mod tests {
 		assert_eq!(ids.get(&hash), Some(second));
 	}
 
-	/// A [`ReceiptWatch`] that plays back scripted lookups.
+	/// A [`ReceiptWatch`] that plays back scripted lookups and waits like the real one, on a
+	/// wake-up flag nothing signals (so, under a paused clock, until a timer runs out).
 	struct ScriptedWatch {
 		looks: VecDeque<Result<InboundReceipt, NodeError>>,
-		/// Once the script is used up, fail every lookup instead of panicking.
-		fail_when_unscripted: bool,
-		looked: usize,
+		/// What every lookup returns once the script is used up.
+		unscripted: fn() -> Result<InboundReceipt, NodeError>,
+		start: Instant,
+		/// When each lookup happened, since `start`.
+		looked_at: Vec<Duration>,
+		/// Whether each wait followed a failed lookup.
 		waits: Vec<bool>,
-		/// Whether wake-ups can still come.
-		alive: bool,
+		flag: watch::Receiver<()>,
+		/// `None` once no wake-up can come any more.
+		sender: Option<watch::Sender<()>>,
 	}
 
 	impl ScriptedWatch {
-		fn new(looks: Vec<Result<InboundReceipt, NodeError>>) -> Self {
+		fn new(
+			looks: Vec<Result<InboundReceipt, NodeError>>,
+			unscripted: fn() -> Result<InboundReceipt, NodeError>,
+		) -> Self {
+			let (sender, flag) = watch::channel(());
 			Self {
 				looks: looks.into(),
-				fail_when_unscripted: false,
-				looked: 0,
+				unscripted,
+				start: Instant::now(),
+				looked_at: Vec::new(),
 				waits: Vec::new(),
-				alive: true,
+				flag,
+				sender: Some(sender),
 			}
 		}
 	}
 
 	impl ReceiptWatch for ScriptedWatch {
 		fn look(&mut self) -> Result<InboundReceipt, NodeError> {
-			self.looked += 1;
-			match self.looks.pop_front() {
-				Some(look) => look,
-				None if self.fail_when_unscripted => store_error(),
-				None => panic!("looked more often than scripted"),
-			}
+			self.looked_at.push(self.start.elapsed());
+			self.looks.pop_front().unwrap_or_else(self.unscripted)
 		}
 
-		async fn wait(&mut self, after_error: bool) -> bool {
+		async fn wait(&mut self, after_error: bool, deadline: Instant) -> bool {
 			self.waits.push(after_error);
-			// Yield like a real wait would, so a test can time the loop out.
-			tokio::task::yield_now().await;
-			self.alive
+			// A wait that spins past its deadline keeps the paused clock from advancing, so no
+			// timer could end the test: fail it instead.
+			assert!(self.waits.len() < 1_000, "kept waiting past the deadline");
+			wait_for_wake_up(&mut self.flag, after_error, deadline).await
 		}
 	}
 
@@ -1139,54 +1181,115 @@ mod tests {
 		)))
 	}
 
+	fn not_yet() -> Result<InboundReceipt, NodeError> {
+		Ok(InboundReceipt::NotYet)
+	}
+
 	fn store_error() -> Result<InboundReceipt, NodeError> {
 		Err(NodeError::PersistenceFailed)
 	}
 
-	async fn run(watch: &mut ScriptedWatch) -> Option<PaymentDetails> {
+	fn unscripted() -> Result<InboundReceipt, NodeError> {
+		panic!("looked more often than scripted")
+	}
+
+	fn secs(s: u64) -> Duration {
+		Duration::from_secs(s)
+	}
+
+	async fn run(watch: &mut ScriptedWatch, deadline_in: Duration) -> Option<PaymentDetails> {
 		let logger = Logger::new(&crate::logging::LoggerType::LogFacade).expect("logger");
-		await_inbound_receipt(watch, PaymentHash(HASH), &logger).await
+		let deadline = Instant::now() + deadline_in;
+		await_inbound_receipt(watch, PaymentHash(HASH), deadline, &logger).await
 	}
 
-	/// A store error that never clears never ends the wait: giving up would leave the rebalance
-	/// unrecorded.
-	#[tokio::test]
-	async fn rebalance_wait_never_gives_up_on_a_persistent_store_error() {
-		let mut watch = ScriptedWatch::new(Vec::new());
-		watch.fail_when_unscripted = true;
-		let res = tokio::time::timeout(Duration::from_millis(200), run(&mut watch)).await;
-		assert!(res.is_err(), "the wait ended on a persistent store error");
-		assert!(watch.looked > 10, "only {} lookups", watch.looked);
-		// Every wait after a failed lookup is the bounded one, so a missed receipt is looked
-		// for again even if no wake-up comes.
-		assert!(watch.waits.iter().all(|after_error| *after_error));
+	/// A payment that never arrives (ldk-node refused it without recording a failure, say) ends
+	/// the wait at the deadline, after one last look.
+	#[tokio::test(start_paused = true)]
+	async fn rebalance_wait_ends_at_the_deadline_without_a_receipt() {
+		let mut watch = ScriptedWatch::new(Vec::new(), not_yet);
+		assert_eq!(run(&mut watch, secs(3_600)).await, None);
+		assert_eq!(watch.looked_at, vec![secs(0), secs(3_600)]);
+		assert_eq!(watch.waits, vec![false]);
 	}
 
-	/// However many lookups fail first, a payment that is then found is the result.
-	#[tokio::test]
-	async fn rebalance_wait_succeeds_after_store_errors() {
-		let mut looks: Vec<_> = (0..10).map(|_| store_error()).collect();
-		looks.push(Ok(InboundReceipt::NotYet));
-		looks.push(store_error());
-		looks.push(received());
-		let mut watch = ScriptedWatch::new(looks);
-		assert_eq!(run(&mut watch).await.map(|p| p.id), Some(PaymentId([0x33; 32])));
-		assert_eq!(watch.looked, 13);
-		let mut expected_waits = vec![true; 10];
-		expected_waits.extend([false, true]);
-		assert_eq!(watch.waits, expected_waits);
+	/// After a failed lookup the wait looks again every 10 s even without a wake-up, and a
+	/// payment found before the deadline is the result however many lookups failed first.
+	#[tokio::test(start_paused = true)]
+	async fn rebalance_wait_retries_store_errors_every_ten_seconds() {
+		let looks = vec![store_error(), store_error(), store_error(), store_error(), received()];
+		let mut watch = ScriptedWatch::new(looks, unscripted);
+		assert_eq!(run(&mut watch, secs(3_600)).await.map(|p| p.id), Some(PaymentId([0x33; 32])));
+		assert_eq!(watch.looked_at, vec![secs(0), secs(10), secs(20), secs(30), secs(40)]);
+		assert_eq!(watch.waits, vec![true; 4]);
 	}
 
-	#[tokio::test]
+	/// Store errors are retried until the deadline, not forever, with a last look at it.
+	#[tokio::test(start_paused = true)]
+	async fn rebalance_wait_retries_store_errors_until_the_deadline() {
+		let mut watch = ScriptedWatch::new(Vec::new(), store_error);
+		assert_eq!(run(&mut watch, secs(35)).await, None);
+		assert_eq!(watch.looked_at, vec![secs(0), secs(10), secs(20), secs(30), secs(35)]);
+		assert_eq!(watch.waits, vec![true; 4]);
+	}
+
+	#[tokio::test(start_paused = true)]
 	async fn rebalance_wait_ends_on_a_failed_payment_or_without_wake_ups() {
-		let mut watch = ScriptedWatch::new(vec![Ok(InboundReceipt::Failed)]);
-		assert_eq!(run(&mut watch).await, None);
+		let mut watch = ScriptedWatch::new(vec![Ok(InboundReceipt::Failed)], unscripted);
+		assert_eq!(run(&mut watch, secs(3_600)).await, None);
 		assert!(watch.waits.is_empty());
 
-		let mut watch = ScriptedWatch::new(vec![Ok(InboundReceipt::NotYet)]);
-		watch.alive = false;
-		assert_eq!(run(&mut watch).await, None);
-		assert_eq!(watch.looked, 1);
+		let mut watch = ScriptedWatch::new(vec![not_yet()], unscripted);
+		watch.sender = None;
+		assert_eq!(run(&mut watch, secs(3_600)).await, None);
+		assert_eq!(watch.looked_at, vec![secs(0)]);
+	}
+
+	/// A deadline already past is now; one an `Instant` cannot hold (`Duration::MAX`, for an
+	/// invoice whose expiry overflows) is far away rather than a panic.
+	#[tokio::test(start_paused = true)]
+	async fn instant_at_past_and_unbounded_deadlines() {
+		let now = Instant::now();
+		assert_eq!(instant_at(Duration::ZERO), now);
+		assert!(instant_at(Duration::MAX) > now + secs(50 * 365 * 24 * 60 * 60));
+		let in_an_hour =
+			SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap() + secs(3_600);
+		let at = instant_at(in_an_hour);
+		assert!(at > now + secs(3_590) && at <= now + secs(3_600));
+	}
+
+	/// The wait between lookups: a wake-up ends it at once; otherwise it lasts until the deadline,
+	/// or after a failed lookup at most 10 s; a dropped sender ends it with `false`.
+	#[tokio::test(start_paused = true)]
+	async fn wait_for_wake_up_timing() {
+		let (sender, mut flag) = watch::channel(());
+		let far = Instant::now() + secs(3_600);
+
+		let start = Instant::now();
+		assert!(wait_for_wake_up(&mut flag, true, far).await);
+		assert_eq!(start.elapsed(), secs(10));
+
+		let start = Instant::now();
+		assert!(wait_for_wake_up(&mut flag, true, Instant::now() + secs(3)).await);
+		assert_eq!(start.elapsed(), secs(3));
+
+		let start = Instant::now();
+		assert!(wait_for_wake_up(&mut flag, false, Instant::now() + secs(600)).await);
+		assert_eq!(start.elapsed(), secs(600));
+
+		let signal = sender.clone();
+		tokio::spawn(async move {
+			tokio::time::sleep(secs(4)).await;
+			signal.send(()).unwrap();
+		});
+		let start = Instant::now();
+		assert!(wait_for_wake_up(&mut flag, false, far).await);
+		assert_eq!(start.elapsed(), secs(4));
+
+		drop(sender);
+		let start = Instant::now();
+		assert!(!wait_for_wake_up(&mut flag, false, far).await);
+		assert_eq!(start.elapsed(), secs(0));
 	}
 
 	/// ldk-node's payment namespace (`PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE`, crate-private
