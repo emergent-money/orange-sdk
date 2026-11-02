@@ -873,6 +873,9 @@ impl Wallet {
 			receive_fee: Option<Amount>,
 			send_fee: Option<Amount>,
 			transaction: Option<Transaction>,
+			/// A trusted-to-Lightning transfer, whose send fee comes from the trusted wallet's
+			/// listing and may be missing.
+			from_trusted: bool,
 		}
 
 		// Multi-path payments are split into a trusted leg and a lightning leg. We merge the two
@@ -891,6 +894,7 @@ impl Wallet {
 						let entry = internal_transfers
 							.entry(*payment_triggering_transfer)
 							.or_insert(InternalTransfer::default());
+						entry.from_trusted = true;
 						if payment.id == *trusted_payment {
 							debug_assert!(entry.send_fee.is_none());
 							entry.send_fee = Some(payment.fee);
@@ -1031,6 +1035,7 @@ impl Wallet {
 						let entry = internal_transfers
 							.entry(*payment_triggering_transfer)
 							.or_insert(InternalTransfer::default());
+						entry.from_trusted = true;
 						if payment.id.0 == *lightning_payment {
 							debug_assert!(entry.receive_fee.is_none());
 							entry.receive_fee = lightning_receive_fee.or(Some(Amount::ZERO));
@@ -1058,6 +1063,7 @@ impl Wallet {
 								receive_fee: lightning_receive_fee,
 								send_fee: None,
 								transaction: None,
+								from_trusted: false,
 							});
 						debug_assert!(entry.transaction.is_none());
 
@@ -1138,8 +1144,14 @@ impl Wallet {
 		}
 
 		for (id, tx_info) in internal_transfers {
+			// An on-chain-to-Lightning transfer's send fee is that of our own funding transaction,
+			// always listed. A trusted-to-Lightning transfer's comes from the trusted wallet's
+			// listing, which can lack the send: the rebalancer records a transfer once our node
+			// has received the payment, without waiting for the trusted side's verdict, and Cashu
+			// lists a melt only once it finalized as paid (never, after a failed melt or while one
+			// is pending). The transfer then shows the receive fee alone.
 			debug_assert!(
-				tx_info.send_fee.is_some(),
+				tx_info.send_fee.is_some() || tx_info.from_trusted,
 				"Internal transfers must have a send fee, got {id}: {tx_info:?}",
 			);
 			debug_assert!(tx_info.transaction.is_some());
@@ -1359,8 +1371,9 @@ impl Wallet {
 	}
 
 	/// Test only: from now on the trusted wallet reports no outcome for its payments, as Spark does
-	/// for a send it lists as failed after the payment was received. Only the dummy trusted wallet
-	/// implements it.
+	/// for a send it lists as failed after the payment was received, and does not list the payments
+	/// it makes, as Cashu does for a melt that has not finalized as paid. Only the dummy trusted
+	/// wallet implements it.
 	#[cfg(feature = "_test-utils")]
 	#[doc(hidden)]
 	pub fn withhold_trusted_payment_outcomes_for_tests(&self) {

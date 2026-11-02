@@ -396,9 +396,10 @@ async fn test_sweep_to_ln_through_payment_store_search() {
 }
 
 /// The same sweep with a trusted wallet that reports no outcome for its payment after our node
-/// received it (as Spark for a send it lists as failed once the operator got no preimage back).
-/// The receipt makes the rebalance complete: it is recorded, with the trusted fee unknown, and
-/// history is the same as for any rebalance.
+/// received it (as Spark for a send it lists as failed once the operator got no preimage back)
+/// and does not list that payment (as Cashu for a melt that has not finalized as paid). The
+/// receipt makes the rebalance complete: it is recorded, with the trusted fee unknown, history is
+/// the same as for any rebalance, and the transfer's fee is the Lightning receive fee alone.
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_without_a_trusted_outcome() {
@@ -488,20 +489,20 @@ async fn run_test_sweep_to_ln(forget_inbound_payment_ids: bool, withhold_trusted
 
 		let expect_amt = intermediate_amt.saturating_add(recv_amt);
 
-		let (received_rebalance_amount, received_rebalance_id) = match wait_next_event(&wallet)
-			.await
-		{
-			Event::PaymentReceived { payment_id, amount_msat, lsp_fee_msats, .. } => {
-				assert!(matches!(payment_id, orange_sdk::PaymentId::SelfCustodial(_)));
-				let lsp_fee_msats = lsp_fee_msats.expect("rebalance receive should pay LSP fee");
-				assert!(
-					amount_msat + lsp_fee_msats <= expect_amt.milli_sats(),
-					"rebalance receive should not exceed trusted balance after fees"
-				);
-				(amount_msat + lsp_fee_msats, payment_id)
-			},
-			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
-		};
+		let (received_rebalance_amount, received_rebalance_id, rebalance_lsp_fee_msats) =
+			match wait_next_event(&wallet).await {
+				Event::PaymentReceived { payment_id, amount_msat, lsp_fee_msats, .. } => {
+					assert!(matches!(payment_id, orange_sdk::PaymentId::SelfCustodial(_)));
+					let lsp_fee_msats =
+						lsp_fee_msats.expect("rebalance receive should pay LSP fee");
+					assert!(
+						amount_msat + lsp_fee_msats <= expect_amt.milli_sats(),
+						"rebalance receive should not exceed trusted balance after fees"
+					);
+					(amount_msat + lsp_fee_msats, payment_id, lsp_fee_msats)
+				},
+				e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
+			};
 
 		let event = wait_next_event(&wallet).await;
 		match event {
@@ -569,6 +570,14 @@ async fn run_test_sweep_to_ln(forget_inbound_payment_ids: bool, withhold_trusted
 			second_tx.fee.is_some_and(|a| a > Amount::ZERO),
 			"Second transaction should have fee greater than 0"
 		);
+		if withhold_trusted_outcome {
+			// The trusted wallet lists no send for the rebalance, so the transfer carries the
+			// Lightning receive fee only.
+			assert_eq!(
+				second_tx.fee,
+				Some(Amount::from_milli_sats(rebalance_lsp_fee_msats).unwrap())
+			);
+		}
 
 		// Verify total amounts match expected
 		let total_tx_amount = first_tx.amount.unwrap().saturating_add(second_tx.amount.unwrap());

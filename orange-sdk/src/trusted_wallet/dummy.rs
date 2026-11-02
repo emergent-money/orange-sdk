@@ -32,7 +32,8 @@ use uuid::Uuid;
 pub(crate) struct DummyTrustedWallet {
 	/// How many of the next BOLT 11 payments to fail on purpose (`fail_next_payments_for_tests`).
 	fail_next_payments: Arc<AtomicUsize>,
-	/// Whether `await_payment_success` reports nothing (`withhold_payment_outcomes_for_tests`).
+	/// Whether `await_payment_success` reports nothing and payments made are not listed
+	/// (`withhold_payment_outcomes_for_tests`).
 	withhold_outcomes: Arc<AtomicBool>,
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,
@@ -515,6 +516,12 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 				.duration_since(std::time::UNIX_EPOCH)
 				.unwrap_or_default()
 				.as_secs();
+
+			// Withholding outcomes, the payment is not listed either, as Cashu lists a melt only
+			// once it has finalized as paid.
+			if self.withhold_outcomes.load(Ordering::SeqCst) {
+				return Ok(id);
+			}
 
 			// add to payments
 			let mut list = self.payments.write().await;
