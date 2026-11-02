@@ -1095,6 +1095,169 @@ mod tests {
 		tx_metadata.insert(PaymentId::Trusted([3u8; 32]), payment).await;
 	}
 
+	/// A store that keeps nothing and, once [`Self::hold_writes`] is called, holds every write
+	/// until [`Self::release_write`], signalling each one on `write_started` and logging its key.
+	struct HeldWriteStore {
+		hold: Arc<std::sync::atomic::AtomicBool>,
+		write_started: Arc<tokio::sync::Notify>,
+		release: Arc<tokio::sync::Notify>,
+		written: Arc<std::sync::Mutex<Vec<String>>>,
+	}
+
+	impl HeldWriteStore {
+		fn new() -> Self {
+			Self {
+				hold: Arc::default(),
+				write_started: Arc::default(),
+				release: Arc::default(),
+				written: Arc::default(),
+			}
+		}
+
+		fn hold_writes(&self) {
+			self.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+		}
+
+		async fn write_started(&self) {
+			tokio::time::timeout(Duration::from_secs(10), self.write_started.notified())
+				.await
+				.expect("a write started");
+		}
+
+		fn release_write(&self) {
+			self.release.notify_one();
+		}
+	}
+
+	impl KVStore for HeldWriteStore {
+		fn read(
+			&self, _primary_namespace: &str, _secondary_namespace: &str, _key: &str,
+		) -> impl Future<Output = Result<Vec<u8>, io::Error>> + Send + 'static {
+			std::future::ready(Err(io::Error::new(io::ErrorKind::NotFound, "nothing stored")))
+		}
+
+		fn write(
+			&self, _primary_namespace: &str, _secondary_namespace: &str, key: &str, _buf: Vec<u8>,
+		) -> impl Future<Output = Result<(), io::Error>> + Send + 'static {
+			let held = self.hold.load(std::sync::atomic::Ordering::SeqCst);
+			let (key, written) = (key.to_owned(), Arc::clone(&self.written));
+			let (write_started, release) =
+				(Arc::clone(&self.write_started), Arc::clone(&self.release));
+			async move {
+				if held {
+					written.lock().unwrap().push(key);
+					write_started.notify_one();
+					release.notified().await;
+				}
+				Ok(())
+			}
+		}
+
+		fn remove(
+			&self, _primary_namespace: &str, _secondary_namespace: &str, _key: &str, _lazy: bool,
+		) -> impl Future<Output = Result<(), io::Error>> + Send + 'static {
+			std::future::ready(Ok(()))
+		}
+
+		fn list(
+			&self, _primary_namespace: &str, _secondary_namespace: &str,
+		) -> impl Future<Output = Result<Vec<String>, io::Error>> + Send + 'static {
+			std::future::ready(Ok(Vec::new()))
+		}
+	}
+
+	impl ldk_node::lightning::util::persist::PaginatedKVStore for HeldWriteStore {
+		fn list_paginated(
+			&self, _primary_namespace: &str, _secondary_namespace: &str,
+			_page_token: Option<ldk_node::lightning::util::persist::PageToken>,
+		) -> impl Future<
+			Output = Result<ldk_node::lightning::util::persist::PaginatedListResponse, io::Error>,
+		> + Send
+		+ 'static {
+			std::future::ready(Ok(ldk_node::lightning::util::persist::PaginatedListResponse {
+				keys: Vec::new(),
+				next_page_token: None,
+			}))
+		}
+	}
+
+	// A trusted-to-Lightning transfer's three records (the promoted trigger, the Lightning
+	// payment's and the trusted payment's) land in memory under one write lock, before any of
+	// them is persisted: a reader sees all three or none, wherever persistence is. The records
+	// are then persisted promotion first (trigger, Lightning, trusted).
+	#[tokio::test]
+	async fn transfer_records_land_in_memory_together_before_persistence() {
+		let store = Arc::new(HeldWriteStore::new());
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store) as Arc<dyn DynStore>).await;
+		let trigger = PaymentId::Trusted([1u8; 32]);
+		let trusted = PaymentId::Trusted([2u8; 32]);
+		tx_metadata
+			.insert(
+				trigger,
+				TxMetadata {
+					ty: TxType::Payment { ty: PaymentType::IncomingLightning {} },
+					time: Duration::from_secs(1),
+				},
+			)
+			.await;
+		tx_metadata
+			.insert(
+				trusted,
+				TxMetadata { ty: TxType::PendingRebalance {}, time: Duration::from_secs(1) },
+			)
+			.await;
+		let transfer = TxMetadata {
+			ty: TxType::TrustedToLightning {
+				trusted_payment: [2u8; 32],
+				lightning_payment: LIGHTNING_LEG,
+				payment_triggering_transfer: trigger,
+			},
+			time: Duration::from_secs(2),
+		};
+		// How many of the three records a reader sees in their transfer state.
+		let recorded = |tx_metadata: &TxMetadataStore| {
+			let map = tx_metadata.read();
+			let trigger_promoted = matches!(
+				map.get(&trigger).map(|m| m.ty),
+				Some(TxType::PaymentTriggeringTransferLightning { .. })
+			);
+			let lightning = map.get(&lightning_id()).map(|m| m.ty) == Some(transfer.ty);
+			let trusted = map.get(&trusted).map(|m| m.ty) == Some(transfer.ty);
+			[trigger_promoted, lightning, trusted].into_iter().filter(|r| *r).count()
+		};
+		assert_eq!(recorded(&tx_metadata), 0);
+
+		store.hold_writes();
+		let writer = {
+			let tx_metadata = tx_metadata.clone();
+			tokio::spawn(async move {
+				tx_metadata
+					.set_tx_caused_rebalance_with_transfer(
+						&trigger,
+						lightning_id(),
+						trusted,
+						transfer,
+					)
+					.await
+			})
+		};
+		for persisted in 0..3 {
+			store.write_started().await;
+			assert_eq!(
+				recorded(&tx_metadata),
+				3,
+				"a reader saw a partial transfer with {persisted} of its records persisted",
+			);
+			store.release_write();
+		}
+		writer.await.unwrap().unwrap();
+		assert_eq!(recorded(&tx_metadata), 3);
+		assert_eq!(
+			*store.written.lock().unwrap(),
+			[trigger.to_string(), lightning_id().to_string(), trusted.to_string()],
+		);
+	}
+
 	#[tokio::test]
 	async fn record_mpp_leg_combines_both_legs_once() {
 		let (_path, store) = temp_sqlite_store();
