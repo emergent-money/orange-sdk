@@ -844,6 +844,12 @@ impl InboundReceiptSearch {
 mod tests {
 	use super::*;
 	use ldk_node::bitcoin::Txid;
+	use ldk_node::bitcoin::hex::DisplayHex;
+	use ldk_node::lightning::util::persist::{
+		KVStore, PageToken, PaginatedKVStore, PaginatedListResponse,
+	};
+	use ldk_node::lightning::util::ser::Writeable;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	fn dummy_outpoint(seed: u8) -> OutPoint {
 		let bytes = [seed; 32];
@@ -1007,5 +1013,161 @@ mod tests {
 		// A later claimable payment to the same hash (which is failed back) does not hide it.
 		ids.record_claimable(hash, first);
 		assert_eq!(ids.get(&hash), Some(second));
+	}
+
+	/// ldk-node's payment namespace (`PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE`, crate-private
+	/// there).
+	const PAYMENTS_NAMESPACE: &str = "payments";
+
+	/// A SQLite store that counts the reads and listed pages of ldk-node's payment namespace.
+	struct CountingStore {
+		inner: ldk_node::io::sqlite_store::SqliteStore,
+		payment_reads: Arc<AtomicUsize>,
+		payment_pages: Arc<AtomicUsize>,
+	}
+
+	impl KVStore for CountingStore {
+		fn read(
+			&self, p: &str, s: &str, k: &str,
+		) -> impl Future<Output = Result<Vec<u8>, io::Error>> + Send + 'static {
+			if p == PAYMENTS_NAMESPACE {
+				self.payment_reads.fetch_add(1, Ordering::SeqCst);
+			}
+			KVStore::read(&self.inner, p, s, k)
+		}
+
+		fn write(
+			&self, p: &str, s: &str, k: &str, buf: Vec<u8>,
+		) -> impl Future<Output = Result<(), io::Error>> + Send + 'static {
+			KVStore::write(&self.inner, p, s, k, buf)
+		}
+
+		fn remove(
+			&self, p: &str, s: &str, k: &str, lazy: bool,
+		) -> impl Future<Output = Result<(), io::Error>> + Send + 'static {
+			KVStore::remove(&self.inner, p, s, k, lazy)
+		}
+
+		fn list(
+			&self, p: &str, s: &str,
+		) -> impl Future<Output = Result<Vec<String>, io::Error>> + Send + 'static {
+			KVStore::list(&self.inner, p, s)
+		}
+	}
+
+	impl PaginatedKVStore for CountingStore {
+		fn list_paginated(
+			&self, p: &str, s: &str, page_token: Option<PageToken>,
+		) -> impl Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static {
+			if p == PAYMENTS_NAMESPACE {
+				self.payment_pages.fetch_add(1, Ordering::SeqCst);
+			}
+			PaginatedKVStore::list_paginated(&self.inner, p, s, page_token)
+		}
+	}
+
+	/// What one full `list_payments` scan costs since the payment store became a bounded cache
+	/// (ldk-node 0a3cd95): the cache holds up to 1000 payments but is warmed with only the 50
+	/// newest at start, and listing never adds what it reads to it. So after a restart every scan
+	/// (the rebalancer's on each on-chain sync change, `list_transactions`, a waiting
+	/// `await_payment_receipt` on each wake-up) reads every payment but the 50 newest from the KV
+	/// store, again on every scan; only a lookup by id caches a payment. With SQLite (and VSS)
+	/// pages of 50 keys, a scan also lists ceil(n / 50) pages.
+	///
+	/// This pins those numbers so a change in ldk-node's caching shows up here.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn full_payment_listing_reads_every_payment_beyond_the_warm_cache() {
+		for (n, expected_pages, expected_reads) in [(50, 1, 0), (500, 10, 450)] {
+			let dir = std::env::temp_dir().join(format!(
+				"orange-sdk-list-cost-test-{n}-{}",
+				SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+			));
+			let payment_reads = Arc::new(AtomicUsize::new(0));
+			let payment_pages = Arc::new(AtomicUsize::new(0));
+			let store = CountingStore {
+				inner: ldk_node::io::sqlite_store::SqliteStore::new(
+					dir.join("kv"),
+					Some("ldk.sqlite".to_string()),
+					None,
+				)
+				.expect("sqlite store"),
+				payment_reads: Arc::clone(&payment_reads),
+				payment_pages: Arc::clone(&payment_pages),
+			};
+
+			// Payments written by an earlier run, oldest first.
+			let ids: Vec<PaymentId> = (0..n as u32)
+				.map(|i| {
+					let mut id = [0u8; 32];
+					id[..4].copy_from_slice(&i.to_be_bytes());
+					PaymentId(id)
+				})
+				.collect();
+			for id in &ids {
+				let details = payment(
+					id.0,
+					bolt11(id.0, None),
+					PaymentDirection::Inbound,
+					PaymentStatus::Succeeded,
+				);
+				KVStore::write(
+					&store,
+					PAYMENTS_NAMESPACE,
+					"",
+					&id.0.to_lower_hex_string(),
+					details.encode(),
+				)
+				.await
+				.expect("write payment");
+			}
+
+			let mut builder = ldk_node::Builder::new();
+			builder.set_network(Network::Regtest);
+			builder.set_storage_dir_path(dir.join("ldk").to_str().unwrap().to_string());
+			let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes([9; 64]);
+			let node = builder.build_with_store(node_entropy, store).expect("build ldk-node");
+
+			let scan = || {
+				let (reads, pages) =
+					(payment_reads.load(Ordering::SeqCst), payment_pages.load(Ordering::SeqCst));
+				let mut listed = 0;
+				let mut page_token = None;
+				loop {
+					let page = node.list_payments(page_token).expect("list payments");
+					listed += page.payments.len();
+					match page.next_page_token {
+						Some(token) => page_token = Some(token),
+						None => break,
+					}
+				}
+				assert_eq!(listed, n);
+				(
+					payment_reads.load(Ordering::SeqCst) - reads,
+					payment_pages.load(Ordering::SeqCst) - pages,
+				)
+			};
+
+			let (first_reads, first_pages) = scan();
+			let (second_reads, second_pages) = scan();
+			println!(
+				"n={n}: scan 1 read {first_reads} payments over {first_pages} pages, scan 2 read {second_reads} over {second_pages}"
+			);
+			assert_eq!((first_reads, first_pages), (expected_reads, expected_pages));
+			// Listing does not warm the cache: the next scan reads the same payments again.
+			assert_eq!((second_reads, second_pages), (expected_reads, expected_pages));
+
+			// A lookup by id does cache the payment, saving one read on later scans.
+			let reads = payment_reads.load(Ordering::SeqCst);
+			assert!(node.payment(&ids[0]).expect("payment lookup").is_some());
+			let lookup_reads = payment_reads.load(Ordering::SeqCst) - reads;
+			let (after_lookup_reads, _) = scan();
+			if n > 50 {
+				assert_eq!(lookup_reads, 1);
+				assert_eq!(after_lookup_reads, expected_reads - 1);
+			} else {
+				assert_eq!(lookup_reads, 0);
+				assert_eq!(after_lookup_reads, 0);
+			}
+		}
 	}
 }
