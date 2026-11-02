@@ -511,13 +511,12 @@ impl TxMetadataStore {
 		debug_assert!(!had_old);
 	}
 
-	/// Atomically marks `trigger_id` as a rebalance trigger and writes `splice_metadata` for
-	/// `splice_id`. The in-memory updates happen under a single write lock so that a concurrent
-	/// `list_transactions` either sees both changes or neither — without this, the rebalancer
-	/// briefly exposes a state where the trigger has been promoted to
-	/// `PaymentTriggeringTransferLightning` but the matching `OnchainToLightning` splice entry
-	/// hasn't landed yet, which makes the `InternalTransfer` validation in `list_transactions`
-	/// trip on a missing `send_fee`.
+	/// Marks `trigger_id` as a rebalance trigger and writes `splice_metadata` for `splice_id`. The
+	/// in-memory updates happen under a single write lock, so a concurrent `list_transactions`
+	/// sees both changes or neither. The two keys are then persisted concurrently, so a crash
+	/// between those writes can persist the splice record without the promoted trigger: the
+	/// listing then shows the trigger as a plain payment and cannot place the transfer, which
+	/// debug builds assert on (pre-existing; graduated-wallet#1284).
 	pub async fn set_tx_caused_rebalance_with_splice(
 		&self, trigger_id: &PaymentId, splice_id: PaymentId, splice_metadata: TxMetadata,
 	) -> Result<(), ()> {

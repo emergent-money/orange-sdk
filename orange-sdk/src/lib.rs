@@ -1173,7 +1173,10 @@ impl Wallet {
 			//
 			// The trigger itself predates its transfer, so a listing that has either leg has it too
 			// (ldk-node pages by creation order, which never skips a payment that existed throughout
-			// the walk).
+			// the walk), with one exception: an incoming on-chain deposit fee-bumped after the
+			// wallet saw it. ldk-node keeps that payment under its first txid while the rebalancer
+			// keys the trigger under the second, so the trigger is never listed and the transfer is
+			// dropped (pre-existing; graduated-wallet#1283).
 			debug_assert!(
 				tx_info.transaction.is_some(),
 				"Internal transfers must list their trigger, got {id}: {tx_info:?}",
