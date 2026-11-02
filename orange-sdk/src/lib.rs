@@ -888,9 +888,6 @@ impl Wallet {
 			receive_fee: Option<Amount>,
 			send_fee: Option<Amount>,
 			transaction: Option<Transaction>,
-			/// A trusted-to-Lightning transfer, whose send fee comes from the trusted wallet's
-			/// listing and may be missing.
-			from_trusted: bool,
 		}
 
 		// Multi-path payments are split into a trusted leg and a lightning leg. We merge the two
@@ -909,7 +906,6 @@ impl Wallet {
 						let entry = internal_transfers
 							.entry(*payment_triggering_transfer)
 							.or_insert(InternalTransfer::default());
-						entry.from_trusted = true;
 						if payment.id == *trusted_payment {
 							debug_assert!(entry.send_fee.is_none());
 							entry.send_fee = Some(payment.fee);
@@ -927,11 +923,6 @@ impl Wallet {
 						let entry = internal_transfers
 							.entry(PaymentId::Trusted(payment.id))
 							.or_insert(InternalTransfer::default());
-						// A trusted payment only ever triggers a trusted-to-Lightning transfer. This
-						// lets the transfer be placed even when this listing has neither of its legs
-						// (a receipt that arrived after its payment listing, an unlisted trusted send,
-						// or a crash between the persisted records).
-						entry.from_trusted = true;
 						debug_assert!(entry.transaction.is_none());
 						entry.transaction = Some(Transaction {
 							id: PaymentId::Trusted(payment.id),
@@ -1055,7 +1046,6 @@ impl Wallet {
 						let entry = internal_transfers
 							.entry(*payment_triggering_transfer)
 							.or_insert(InternalTransfer::default());
-						entry.from_trusted = true;
 						if payment.id.0 == *lightning_payment {
 							debug_assert!(entry.receive_fee.is_none());
 							entry.receive_fee = lightning_receive_fee.or(Some(Amount::ZERO));
@@ -1069,6 +1059,11 @@ impl Wallet {
 							.or_insert(InternalTransfer::default());
 						if &payment.id.0 == channel_txid.as_byte_array() {
 							debug_assert!(entry.send_fee.is_none());
+							// Our own funding transaction: once listed, it carries its fee.
+							debug_assert!(
+								payment.fee_paid_msat.is_some(),
+								"A listed funding payment must carry its fee, got {payment:?}",
+							);
 							entry.send_fee = payment
 								.fee_paid_msat
 								.map(|fee| Amount::from_milli_sats(fee).expect("Must be valid"));
@@ -1083,7 +1078,6 @@ impl Wallet {
 								receive_fee: lightning_receive_fee,
 								send_fee: None,
 								transaction: None,
-								from_trusted: false,
 							});
 						debug_assert!(entry.transaction.is_none());
 
@@ -1164,18 +1158,25 @@ impl Wallet {
 		}
 
 		for (id, tx_info) in internal_transfers {
-			// An on-chain-to-Lightning transfer's send fee is that of our own funding transaction,
-			// always listed. A trusted-to-Lightning transfer's comes from the trusted wallet's
-			// listing, which can lack the send: the rebalancer records a transfer once our node
-			// has received the payment, without waiting for the trusted side's verdict, and Cashu
-			// lists a melt only once it finalized as paid (never, after a failed melt or while one
-			// is pending). The transfer then shows the receive fee alone. Such a transfer is known
-			// from its trusted trigger, or from either leg's record.
+			// A transfer shows the fees of the legs this listing has: a listed sending leg carries
+			// its fee (asserted where it is read), and a leg this listing lacks adds nothing. The
+			// sending leg can be missing for either kind of transfer. A listing that walked ldk-node's
+			// payments before an on-chain transfer's funding payment existed, and read the metadata
+			// after the transfer was recorded, has the promoted trigger but not the funding payment
+			// (a paged walk lists only the payments that existed throughout it). The trusted wallet's
+			// listing can lack a trusted-to-Lightning transfer's send: the rebalancer records a
+			// transfer once our node has received the payment, without waiting for the trusted
+			// side's verdict, and Cashu lists a melt only once it finalized as paid (never, after a
+			// failed melt or while one is pending). A crash between the persisted records leaves
+			// the same state. The transfer then shows the receive fee alone, or no fee yet.
+			//
+			// The trigger itself predates its transfer, so a listing that has either leg has it too
+			// (ldk-node pages by creation order, which never skips a payment that existed throughout
+			// the walk).
 			debug_assert!(
-				tx_info.send_fee.is_some() || tx_info.from_trusted,
-				"Internal transfers must have a send fee, got {id}: {tx_info:?}",
+				tx_info.transaction.is_some(),
+				"Internal transfers must list their trigger, got {id}: {tx_info:?}",
 			);
-			debug_assert!(tx_info.transaction.is_some());
 
 			if let Some(mut transaction) = tx_info.transaction {
 				transaction.fee = Some(

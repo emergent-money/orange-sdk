@@ -3151,3 +3151,73 @@ async fn test_failed_trusted_rebalance_payment_releases_the_rebalancer() {
 	})
 	.await;
 }
+
+/// A listing that walks the ldk-node payments before an on-chain rebalance's funding payment
+/// exists, and reads the metadata after the rebalance was recorded, sees the promoted trigger
+/// without the funding payment that carries the transfer's fee. It must still list, showing the
+/// fees it has. Any listing that overlaps the sweep can do this: ldk-node's `list_payments` is a
+/// paged store walk, which lists only the payments that existed throughout it.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_onchain_listing_across_transfer_record() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let bitcoind = Arc::clone(&params.bitcoind);
+		let third_party = Arc::clone(&params.third_party);
+		let electrsd = Arc::clone(&params.electrsd);
+
+		wallet.set_rebalance_enabled(false).await;
+		let recv_amt = Amount::from_sats(200_000).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		let sent_txid = third_party
+			.onchain_payment()
+			.send_to_address(&uri.address.unwrap(), recv_amt.sats().unwrap(), None)
+			.unwrap();
+		wait_for_tx(&electrsd.client, sent_txid).await;
+		generate_blocks(&bitcoind, &electrsd, 6).await;
+		wallet.sync_ln_wallet().unwrap();
+		test_utils::wait_for_condition("on-chain receive confirmed", || async {
+			wallet.get_balance().await.unwrap().pending_balance == recv_amt
+		})
+		.await;
+
+		// A listing walks the payments now, before any funding payment exists.
+		wallet.arm_listing_pause_for_tests();
+		let w = Arc::clone(&wallet);
+		let listing = tokio::spawn(async move { w.list_transactions().await });
+		tokio::time::timeout(Duration::from_secs(20), wallet.listing_pause_reached_for_tests())
+			.await
+			.expect("the listing walked the payments");
+
+		// The on-chain receive now graduates to a channel; a fresh listing shows its fee.
+		wallet.set_rebalance_enabled(true).await;
+		test_utils::wait_for_condition("graduated on-chain receive shows its fee", || async {
+			while wallet.next_event().is_some() {
+				wallet.event_handled().unwrap();
+			}
+			generate_blocks(&bitcoind, &electrsd, 6).await;
+			wallet.sync_ln_wallet().unwrap();
+			wallet
+				.list_transactions()
+				.await
+				.unwrap()
+				.iter()
+				.any(|tx| !tx.outbound && tx.fee.is_some_and(|f| f > Amount::ZERO))
+		})
+		.await;
+
+		// The paused listing reads the metadata only now: it has the promoted trigger but not the
+		// funding payment. It must list, and (proof that it overlapped) show no fee for it yet.
+		wallet.resume_listing_for_tests();
+		let txs = listing.await.expect("the overlapping listing panicked").unwrap();
+		let receive = txs
+			.iter()
+			.find(|tx| !tx.outbound && tx.amount == Some(recv_amt))
+			.expect("the overlapping listing shows the on-chain receive");
+		assert!(
+			!receive.fee.is_some_and(|f| f > Amount::ZERO),
+			"the listing saw the funding payment: {receive:?}"
+		);
+	})
+	.await;
+}
