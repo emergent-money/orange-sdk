@@ -434,6 +434,21 @@ async fn test_sweep_to_ln_listing_across_transfer_records() {
 		.await;
 }
 
+/// The overlapping listing of `test_sweep_to_ln_listing_across_transfer_records` with the
+/// rebalance's trusted send unlisted (as Cashu, for a melt not finalized as paid): the listing has
+/// neither the Lightning receipt nor the send, so only the promoted trigger tells it the transfer
+/// is trusted-to-Lightning.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_sweep_to_ln_listing_across_transfer_records_without_a_trusted_outcome() {
+	run_test_sweep_to_ln(SweepVariant {
+		withhold_trusted_outcome: true,
+		list_across_transfer_records: true,
+		..Default::default()
+	})
+	.await;
+}
+
 /// What to vary in [`run_test_sweep_to_ln`].
 #[derive(Clone, Copy, Default)]
 struct SweepVariant {

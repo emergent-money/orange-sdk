@@ -927,6 +927,11 @@ impl Wallet {
 						let entry = internal_transfers
 							.entry(PaymentId::Trusted(payment.id))
 							.or_insert(InternalTransfer::default());
+						// A trusted payment only ever triggers a trusted-to-Lightning transfer. This
+						// lets the transfer be placed even when this listing has neither of its legs
+						// (a receipt that arrived after its payment listing, an unlisted trusted send,
+						// or a crash between the persisted records).
+						entry.from_trusted = true;
 						debug_assert!(entry.transaction.is_none());
 						entry.transaction = Some(Transaction {
 							id: PaymentId::Trusted(payment.id),
@@ -1164,7 +1169,8 @@ impl Wallet {
 			// listing, which can lack the send: the rebalancer records a transfer once our node
 			// has received the payment, without waiting for the trusted side's verdict, and Cashu
 			// lists a melt only once it finalized as paid (never, after a failed melt or while one
-			// is pending). The transfer then shows the receive fee alone.
+			// is pending). The transfer then shows the receive fee alone. Such a transfer is known
+			// from its trusted trigger, or from either leg's record.
 			debug_assert!(
 				tx_info.send_fee.is_some() || tx_info.from_trusted,
 				"Internal transfers must have a send fee, got {id}: {tx_info:?}",
