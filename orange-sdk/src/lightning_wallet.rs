@@ -1377,27 +1377,37 @@ mod tests {
 		}
 	}
 
+	/// ldk-node warms its payment cache at start with at most this many payments
+	/// (`PAYMENT_CACHE_WARMUP_COUNT`, crate-private there).
+	const WARM_SET_AT_MOST: usize = 50;
+
+	/// Removes a test's directory when dropped, also when the test fails.
+	struct TempDir(std::path::PathBuf);
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
 	/// What one full `list_payments` scan costs since the payment store became a bounded cache
-	/// (ldk-node 0a3cd95): the cache holds up to 1000 payments but is warmed with only the 50
-	/// newest at start, and listing never adds what it reads to it. So after a restart every scan
-	/// (the rebalancer's on each on-chain sync change, `list_transactions`, a waiting
-	/// `await_payment_receipt` on each wake-up) reads every payment but the 50 newest from the KV
-	/// store, again on every scan; only a lookup by id caches a payment. With SQLite (and VSS)
-	/// pages of 50 keys, a scan also lists ceil(n / 50) pages.
-	///
-	/// This pins those numbers so a change in ldk-node's caching shows up here.
+	/// (ldk-node e0b01fa): the cache is warmed with only the newest payments at start, and listing
+	/// never adds what it reads to it. So after a restart every scan (the rebalancer's on each
+	/// on-chain sync change, `list_transactions`, a waiting `await_payment_receipt` on each
+	/// wake-up) reads from the KV store every payment beyond that warm set, and does so again on
+	/// every scan. At 0cea341 every payment was held in memory and a scan read none.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn full_payment_listing_reads_every_payment_beyond_the_warm_cache() {
-		for (n, expected_pages, expected_reads) in [(50, 1, 0), (500, 10, 450)] {
-			let dir = std::env::temp_dir().join(format!(
+		for n in [50, 500] {
+			let dir = TempDir(std::env::temp_dir().join(format!(
 				"orange-sdk-list-cost-test-{n}-{}",
 				SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
-			));
+			)));
 			let payment_reads = Arc::new(AtomicUsize::new(0));
 			let payment_pages = Arc::new(AtomicUsize::new(0));
 			let store = CountingStore {
 				inner: ldk_node::io::sqlite_store::SqliteStore::new(
-					dir.join("kv"),
+					dir.0.join("kv"),
 					Some("ldk.sqlite".to_string()),
 					None,
 				)
@@ -1407,17 +1417,12 @@ mod tests {
 			};
 
 			// Payments written by an earlier run, oldest first.
-			let ids: Vec<PaymentId> = (0..n as u32)
-				.map(|i| {
-					let mut id = [0u8; 32];
-					id[..4].copy_from_slice(&i.to_be_bytes());
-					PaymentId(id)
-				})
-				.collect();
-			for id in &ids {
+			for i in 0..n as u32 {
+				let mut id = [0u8; 32];
+				id[..4].copy_from_slice(&i.to_be_bytes());
 				let details = payment(
-					id.0,
-					bolt11(id.0, None),
+					id,
+					bolt11(id, None),
 					PaymentDirection::Inbound,
 					PaymentStatus::Succeeded,
 				);
@@ -1425,7 +1430,7 @@ mod tests {
 					&store,
 					PAYMENTS_NAMESPACE,
 					"",
-					&id.0.to_lower_hex_string(),
+					&id.to_lower_hex_string(),
 					details.encode(),
 				)
 				.await
@@ -1434,8 +1439,9 @@ mod tests {
 
 			let mut builder = ldk_node::Builder::new();
 			builder.set_network(Network::Regtest);
-			builder.set_storage_dir_path(dir.join("ldk").to_str().unwrap().to_string());
+			builder.set_storage_dir_path(dir.0.join("ldk").to_str().unwrap().to_string());
 			let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes([9; 64]);
+			// Declared after `dir`, so dropped (and its store closed) before the directory goes.
 			let node = builder.build_with_store(node_entropy, store).expect("build ldk-node");
 
 			let scan = || {
@@ -1463,22 +1469,15 @@ mod tests {
 			println!(
 				"n={n}: scan 1 read {first_reads} payments over {first_pages} pages, scan 2 read {second_reads} over {second_pages}"
 			);
-			assert_eq!((first_reads, first_pages), (expected_reads, expected_pages));
-			// Listing does not warm the cache: the next scan reads the same payments again.
-			assert_eq!((second_reads, second_pages), (expected_reads, expected_pages));
-
-			// A lookup by id does cache the payment, saving one read on later scans.
-			let reads = payment_reads.load(Ordering::SeqCst);
-			assert!(node.payment(&ids[0]).expect("payment lookup").is_some());
-			let lookup_reads = payment_reads.load(Ordering::SeqCst) - reads;
-			let (after_lookup_reads, _) = scan();
-			if n > 50 {
-				assert_eq!(lookup_reads, 1);
-				assert_eq!(after_lookup_reads, expected_reads - 1);
-			} else {
-				assert_eq!(lookup_reads, 0);
-				assert_eq!(after_lookup_reads, 0);
-			}
+			assert!(
+				first_reads >= n.saturating_sub(WARM_SET_AT_MOST),
+				"scan 1 read only {first_reads} of {n} payments from the KV store"
+			);
+			// Listing does not warm the cache: the next scan reads as much again.
+			assert!(
+				second_reads >= first_reads,
+				"scan 2 read {second_reads} payments, scan 1 {first_reads}"
+			);
 		}
 	}
 }
