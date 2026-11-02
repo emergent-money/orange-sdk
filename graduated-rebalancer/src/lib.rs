@@ -125,8 +125,9 @@ pub trait TrustedWallet: Send + Sync {
 	///
 	/// The rebalancer races this against the Lightning wallet's receipt of the payment, which
 	/// never comes for a payment that failed before reaching it, so it must resolve only on a
-	/// definite failure: never on an unknown status or a failed lookup. The default never
-	/// resolves, leaving the receipt's deadline to end the wait.
+	/// definite failure: never on an unknown status, a failed lookup, or an error from a send call
+	/// the wallet may still resume. The default never resolves, leaving the receipt's deadline to
+	/// end the wait.
 	fn await_payment_failure(
 		&self, _payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {

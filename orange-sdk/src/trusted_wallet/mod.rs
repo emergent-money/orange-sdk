@@ -43,17 +43,17 @@ pub struct Payment {
 
 pub(crate) type DynTrustedWalletInterface = dyn TrustedWalletInterface + Send + Sync;
 
-/// Payment hashes of outgoing payments a trusted wallet saw go wrong, recorded where the wallet
-/// learns of it (a failed melt, an erroring send call) for
+/// Payment hashes of outgoing payments a trusted wallet saw fail for good, recorded where the
+/// wallet learns of it (Cashu: a failed melt) for
 /// [`TrustedWalletInterface::await_payment_failure`] to wait on.
-#[cfg(any(feature = "spark", feature = "cashu"))]
+#[cfg(feature = "cashu")]
 #[derive(Default)]
 pub(crate) struct SendFailures {
 	hashes: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
 	notify: tokio::sync::Notify,
 }
 
-#[cfg(any(feature = "spark", feature = "cashu"))]
+#[cfg(feature = "cashu")]
 impl SendFailures {
 	pub(crate) fn record(&self, payment_hash: [u8; 32]) {
 		self.hashes.lock().unwrap().insert(payment_hash);
@@ -193,8 +193,9 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// Resolves once our outgoing payment to `payment_hash` is known to have failed, and never if
 	/// it is not. Unlike a `None` from [`Self::await_payment_success`], which can also mean a
 	/// failed lookup, a payment not listed yet or a timeout, this must resolve only on a definite
-	/// failure: the rebalancer stops waiting for the payment's Lightning receipt when it does. The
-	/// default never resolves.
+	/// failure: never on an unknown status, a failed lookup, or an error from a send call the
+	/// wallet may still resume (as Breez resumes pending Spark sends). The rebalancer then stops
+	/// waiting for the payment's Lightning receipt after a grace. The default never resolves.
 	fn await_payment_failure(
 		&self, _payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -324,7 +325,7 @@ impl From<ldk_node::lightning::io::Error> for TrustedError {
 	}
 }
 
-#[cfg(all(test, any(feature = "spark", feature = "cashu")))]
+#[cfg(all(test, feature = "cashu"))]
 mod tests {
 	use super::*;
 	use std::time::Duration;

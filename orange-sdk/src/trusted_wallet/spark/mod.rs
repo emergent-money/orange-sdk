@@ -7,7 +7,7 @@ use crate::bitcoin::hashes::{Hash, sha256};
 use crate::bitcoin::hex::{DisplayHex, FromHex};
 use crate::logging::Logger;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
-use crate::trusted_wallet::{Payment, SendFailures, TrustedError, TrustedWalletInterface};
+use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
 use crate::dyn_store::DynStore;
@@ -103,8 +103,6 @@ pub(crate) struct Spark {
 	spark_wallet: Arc<BreezSdk>,
 	shutdown_sender: watch::Sender<()>,
 	payment_success_flag: watch::Receiver<()>,
-	/// Hashes whose `send_payment` call errored. Breez may have stored no payment for them.
-	send_errors: Arc<SendFailures>,
 	logger: Arc<Logger>,
 }
 
@@ -253,11 +251,9 @@ impl TrustedWalletInterface for Spark {
 				let prepare = self.spark_wallet.prepare_send_payment(params).await?;
 
 				let uuid = Uuid::now_v7();
-				let payment_hash = invoice.payment_hash().0;
 				// spawn payment send in background since it can take a while and we don't want to block the caller
 				let w = Arc::clone(&self.spark_wallet);
 				let logger = Arc::clone(&self.logger);
-				let send_errors = Arc::clone(&self.send_errors);
 				tokio::spawn(async move {
 					match w
 						.send_payment(SendPaymentRequest {
@@ -275,10 +271,9 @@ impl TrustedWalletInterface for Spark {
 							);
 						},
 						Err(e) => {
+							// Not a failure of the payment: Breez records a pending send before
+							// the operator commits it and resumes it on each wallet sync.
 							log_error!(logger, "Failed to send payment: {e:?}");
-							// If Breez stored no payment, nothing else will tell
-							// `await_payment_failure` this payment failed.
-							send_errors.record(payment_hash);
 						},
 					}
 				});
@@ -336,7 +331,7 @@ impl TrustedWalletInterface for Spark {
 				// Breez also reports a send as failed when the operator gets no preimage back,
 				// after the payment was received (for a rebalance, by our own node). It will not
 				// complete after that, so stop waiting rather than hold the rebalancer forever.
-				if spark_send_failed(Some(&res.payments), &payment_hash, false) {
+				if spark_send_failed(Some(&res.payments), &payment_hash) {
 					log_warn!(
 						self.logger,
 						"Spark reports our payment for hash {} failed; for a rebalance, after our node received it. No longer waiting for it to succeed",
@@ -358,20 +353,11 @@ impl TrustedWalletInterface for Spark {
 			loop {
 				flag.mark_unchanged();
 				let listed = self.spark_wallet.list_payments(ListPaymentsRequest::default()).await;
-				let send_errored = self.send_errors.contains(&payment_hash);
 				let listed = listed.as_ref().ok().map(|res| res.payments.as_slice());
-				if spark_send_failed(listed, &payment_hash, send_errored) {
+				if spark_send_failed(listed, &payment_hash) {
 					return;
 				}
-				// Woken on payment successes and on a recorded send error; failed payments are not
-				// signalled, so poll as well.
-				let send_error = async {
-					if send_errored {
-						std::future::pending::<()>().await
-					} else {
-						self.send_errors.recorded(&payment_hash).await
-					}
-				};
+				// Woken on payment successes; failed payments are not signalled, so poll as well.
 				tokio::select! {
 					changed = flag.changed() => {
 						if changed.is_err() {
@@ -379,7 +365,6 @@ impl TrustedWalletInterface for Spark {
 							tokio::time::sleep(Duration::from_secs(1)).await;
 						}
 					},
-					() = send_error => {},
 					() = tokio::time::sleep(Duration::from_secs(10)) => {},
 				}
 			}
@@ -476,8 +461,7 @@ impl Spark {
 
 		log_info!(logger, "Spark wallet initialized");
 
-		let send_errors = Arc::new(SendFailures::default());
-		Ok(Spark { spark_wallet, shutdown_sender, payment_success_flag, send_errors, logger })
+		Ok(Spark { spark_wallet, shutdown_sender, payment_success_flag, logger })
 	}
 
 	pub(crate) async fn await_payment_success(&self) {
@@ -761,19 +745,19 @@ fn is_lightning_send_for_hash(payment: &breez_sdk_spark::Payment, payment_hash: 
 	}
 }
 
-/// Whether our Lightning send to `payment_hash` has failed for good: every send for the hash in
-/// `listed` failed, or none is listed and its `send_payment` call errored. `listed` is `None`
-/// when the listing failed, which is never a failure: we cannot tell.
-fn spark_send_failed(
-	listed: Option<&[breez_sdk_spark::Payment]>, payment_hash: &[u8; 32], send_errored: bool,
-) -> bool {
+/// Whether our Lightning send to `payment_hash` has failed for good: at least one send for the
+/// hash is listed and every one of them failed. `listed` is `None` when the listing failed, which
+/// is never a failure: we cannot tell.
+///
+/// An error from `send_payment` is deliberately not a failure, even with nothing listed: Breez
+/// records a pending send before the operator commits it and resumes it on every wallet sync, and
+/// until that resume is stored the operator lists no send for the hash, so such a send can still
+/// complete. One resumed forever falls to the rebalancer's receipt deadline instead.
+fn spark_send_failed(listed: Option<&[breez_sdk_spark::Payment]>, payment_hash: &[u8; 32]) -> bool {
 	let Some(payments) = listed else { return false };
 	let mut sends =
 		payments.iter().filter(|p| is_lightning_send_for_hash(p, payment_hash)).peekable();
-	if sends.peek().is_none() {
-		return send_errored;
-	}
-	sends.all(|p| p.status == PaymentStatus::Failed)
+	sends.peek().is_some() && sends.all(|p| p.status == PaymentStatus::Failed)
 }
 
 /// Whether `payment` is an incoming Lightning payment, in any state, for `payment_hash`.
@@ -946,28 +930,24 @@ mod tests {
 		let hash = [0x44; 32];
 		let send = |status| lightning_payment(PaymentType::Send, status, hash);
 		let failed = || send(PaymentStatus::Failed);
-		let fails = |listed: &[breez_sdk_spark::Payment], errored| {
-			spark_send_failed(Some(listed), &hash, errored)
-		};
+		let fails = |listed: &[breez_sdk_spark::Payment]| spark_send_failed(Some(listed), &hash);
 
-		// Nothing listed: not failed, unless the send call errored.
-		assert!(!fails(&[], false));
-		assert!(fails(&[], true));
+		// Nothing listed: not failed (Breez may still resume an errored send).
+		assert!(!fails(&[]));
 		// Every listed send failed.
-		assert!(fails(&[failed()], false));
-		assert!(fails(&[failed(), failed()], false));
-		// Any send still pending or completed: not failed, whatever the send call did.
-		assert!(!fails(&[failed(), send(PaymentStatus::Pending)], false));
-		assert!(!fails(&[send(PaymentStatus::Pending)], true));
-		assert!(!fails(&[send(PaymentStatus::Completed)], false));
+		assert!(fails(&[failed()]));
+		assert!(fails(&[failed(), failed()]));
+		// Any send still pending or completed: not failed.
+		assert!(!fails(&[failed(), send(PaymentStatus::Pending)]));
+		assert!(!fails(&[send(PaymentStatus::Pending)]));
+		assert!(!fails(&[send(PaymentStatus::Completed)]));
 		// A failed listing tells us nothing.
-		assert!(!spark_send_failed(None, &hash, false));
-		assert!(!spark_send_failed(None, &hash, true));
+		assert!(!spark_send_failed(None, &hash));
 		// Receives, and sends for other hashes, do not count.
 		let receive = lightning_payment(PaymentType::Receive, PaymentStatus::Failed, hash);
-		assert!(!fails(&[receive], false));
+		assert!(!fails(&[receive]));
 		let other = lightning_payment(PaymentType::Send, PaymentStatus::Failed, [0x55; 32]);
-		assert!(!fails(&[other], false));
+		assert!(!fails(&[other]));
 	}
 
 	#[test]
