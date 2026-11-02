@@ -290,6 +290,9 @@ pub(crate) struct OrangeRebalanceEventHandler {
 	event_queue: Arc<EventQueue>,
 	/// Logger for logging events and errors.
 	logger: Arc<Logger>,
+	/// Test only: a pause between the two transfer records of a `RebalanceSuccessful`.
+	#[cfg(feature = "_test-utils")]
+	pub(crate) record_pause: Arc<TransferRecordPause>,
 }
 
 impl OrangeRebalanceEventHandler {
@@ -297,7 +300,46 @@ impl OrangeRebalanceEventHandler {
 	pub(crate) fn new(
 		tx_metadata: TxMetadataStore, event_queue: Arc<EventQueue>, logger: Arc<Logger>,
 	) -> Self {
-		Self { tx_metadata, event_queue, logger }
+		Self {
+			tx_metadata,
+			event_queue,
+			logger,
+			#[cfg(feature = "_test-utils")]
+			record_pause: Arc::default(),
+		}
+	}
+}
+
+/// Test only: makes the next `RebalanceSuccessful` stop after writing the first of its two
+/// transfer records until resumed, so a test can list transactions while only that one exists.
+#[cfg(feature = "_test-utils")]
+#[derive(Default)]
+pub(crate) struct TransferRecordPause {
+	armed: std::sync::atomic::AtomicBool,
+	first_written: tokio::sync::Notify,
+	resume: tokio::sync::Notify,
+}
+
+#[cfg(feature = "_test-utils")]
+impl TransferRecordPause {
+	pub(crate) fn arm(&self) {
+		self.armed.store(true, Ordering::SeqCst);
+	}
+
+	/// Resolves once an armed pause has been reached.
+	pub(crate) async fn reached(&self) {
+		self.first_written.notified().await;
+	}
+
+	pub(crate) fn resume(&self) {
+		self.resume.notify_one();
+	}
+
+	async fn pause_if_armed(&self) {
+		if self.armed.swap(false, Ordering::SeqCst) {
+			self.first_written.notify_one();
+			self.resume.notified().await;
+		}
 	}
 }
 
@@ -351,10 +393,20 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 						},
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
-					self.tx_metadata.upsert(PaymentId::Trusted(rebalance_id), metadata).await;
-					// `lightning_id` is the id ldk-node stored the received payment under (derived
-					// from its HTLCs, not the payment hash), as `list_transactions` looks it up.
+					// The Lightning record goes first. The Lightning receive is always listed once
+					// its receipt exists, so the transfer entry `list_transactions` builds from it
+					// is marked trusted-to-Lightning (and may then lack a send fee) before the
+					// trusted record appears. The trusted send can be unlisted (Cashu, a melt not
+					// finalized as paid): with the trusted record alone, the entry would have
+					// neither, and debug builds would assert, for good if the process died between
+					// the two writes. `lightning_id` is the id ldk-node stored the received
+					// payment under (derived from its HTLCs, not the payment hash), as
+					// `list_transactions` looks it up. The window between
+					// `set_tx_caused_rebalance` above and this write is #1281's, a separate issue.
 					self.tx_metadata.insert(PaymentId::SelfCustodial(lightning_id), metadata).await;
+					#[cfg(feature = "_test-utils")]
+					self.record_pause.pause_if_armed().await;
+					self.tx_metadata.upsert(PaymentId::Trusted(rebalance_id), metadata).await;
 
 					let event_queue = Arc::clone(&self.event_queue);
 					let logger = Arc::clone(&self.logger);

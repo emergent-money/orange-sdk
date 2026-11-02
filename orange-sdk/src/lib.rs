@@ -126,6 +126,9 @@ struct WalletImpl {
 	logger: Arc<Logger>,
 	/// The Tokio runtime for asynchronous operations.
 	runtime: Arc<Runtime>,
+	/// Test only: see [`Wallet::arm_transfer_record_pause_for_tests`].
+	#[cfg(feature = "_test-utils")]
+	transfer_record_pause: Arc<rebalancer::TransferRecordPause>,
 }
 
 /// The primary entry point for orange-sdk providing a graduated custody Bitcoin wallet.
@@ -773,11 +776,14 @@ impl Wallet {
 			Arc::clone(&logger),
 		));
 
-		let rebalance_events = Arc::new(OrangeRebalanceEventHandler::new(
+		let rebalance_events = OrangeRebalanceEventHandler::new(
 			tx_metadata.clone(),
 			Arc::clone(&event_queue),
 			Arc::clone(&logger),
-		));
+		);
+		#[cfg(feature = "_test-utils")]
+		let transfer_record_pause = Arc::clone(&rebalance_events.record_pause);
+		let rebalance_events = Arc::new(rebalance_events);
 
 		let rebalancer = Arc::new(GraduatedRebalancer::new(
 			wt,
@@ -822,6 +828,8 @@ impl Wallet {
 			store,
 			logger,
 			runtime,
+			#[cfg(feature = "_test-utils")]
+			transfer_record_pause,
 		});
 
 		Ok(Wallet { inner })
@@ -1359,6 +1367,30 @@ impl Wallet {
 	#[doc(hidden)]
 	pub fn set_trusted_failure_receipt_grace_for_tests(&self, grace: Duration) {
 		self.inner.rebalancer.set_trusted_failure_receipt_grace(grace);
+	}
+
+	/// Test only: makes the next rebalance recorded as successful stop after writing the first of
+	/// its two transfer records (the Lightning one), until
+	/// [`Self::resume_transfer_records_for_tests`].
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn arm_transfer_record_pause_for_tests(&self) {
+		self.inner.transfer_record_pause.arm();
+	}
+
+	/// Test only: resolves once the pause armed by [`Self::arm_transfer_record_pause_for_tests`]
+	/// has been reached.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub async fn transfer_record_pause_reached_for_tests(&self) {
+		self.inner.transfer_record_pause.reached().await;
+	}
+
+	/// Test only: ends the pause armed by [`Self::arm_transfer_record_pause_for_tests`].
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn resume_transfer_records_for_tests(&self) {
+		self.inner.transfer_record_pause.resume();
 	}
 
 	/// Test only: an invoice on this node as the rebalancer asks for one.

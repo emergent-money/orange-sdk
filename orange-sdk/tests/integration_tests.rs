@@ -384,7 +384,7 @@ async fn test_pay_mpp_trusted_and_lightning() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln() {
-	run_test_sweep_to_ln(false, false).await;
+	run_test_sweep_to_ln(false, false, false).await;
 }
 
 /// The same sweep with the event handler's hash-to-id map ignored, so the rebalancer's wait can
@@ -392,7 +392,7 @@ async fn test_sweep_to_ln() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_through_payment_store_search() {
-	run_test_sweep_to_ln(true, false).await;
+	run_test_sweep_to_ln(true, false, false).await;
 }
 
 /// The same sweep with a trusted wallet that reports no outcome for its payment after our node
@@ -403,10 +403,22 @@ async fn test_sweep_to_ln_through_payment_store_search() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_without_a_trusted_outcome() {
-	run_test_sweep_to_ln(false, true).await;
+	run_test_sweep_to_ln(false, true, false).await;
 }
 
-async fn run_test_sweep_to_ln(forget_inbound_payment_ids: bool, withhold_trusted_outcome: bool) {
+/// The sweep of `test_sweep_to_ln_without_a_trusted_outcome`, listing transactions while only
+/// the first of the two transfer records is written. That is the Lightning one, so the transfer
+/// is known as trusted-to-Lightning while its trusted send is still unlisted.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_sweep_to_ln_listing_between_transfer_records() {
+	run_test_sweep_to_ln(false, true, true).await;
+}
+
+async fn run_test_sweep_to_ln(
+	forget_inbound_payment_ids: bool, withhold_trusted_outcome: bool,
+	list_between_transfer_records: bool,
+) {
 	test_utils::run_test(move |params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let lsp = Arc::clone(&params.lsp);
@@ -416,6 +428,9 @@ async fn run_test_sweep_to_ln(forget_inbound_payment_ids: bool, withhold_trusted
 		}
 		if withhold_trusted_outcome {
 			wallet.withhold_trusted_payment_outcomes_for_tests();
+		}
+		if list_between_transfer_records {
+			wallet.arm_transfer_record_pause_for_tests();
 		}
 
 		let starting_bal = wallet.get_balance().await.unwrap();
@@ -503,6 +518,19 @@ async fn run_test_sweep_to_ln(forget_inbound_payment_ids: bool, withhold_trusted
 				},
 				e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 			};
+
+		if list_between_transfer_records {
+			tokio::time::timeout(
+				Duration::from_secs(20),
+				wallet.transfer_record_pause_reached_for_tests(),
+			)
+			.await
+			.expect("the rebalance reached the pause between its transfer records");
+			// Only the Lightning record exists and the trusted send is unlisted: the listing must
+			// still place the transfer (debug builds assert when they cannot).
+			wallet.list_transactions().await.unwrap();
+			wallet.resume_transfer_records_for_tests();
+		}
 
 		let event = wait_next_event(&wallet).await;
 		match event {
