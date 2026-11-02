@@ -936,9 +936,28 @@ impl LdkEventHandler {
 		}
 	}
 
+	/// Fails a claimable payment back, then removes the record ldk-node made for it.
+	///
+	/// ldk-node creates that record when the HTLCs arrive (we enable
+	/// `manually_handle_unknown_bolt11_payments`) and `fail_for_id` only marks it failed, so
+	/// without the removal every payment we refuse, including any number of payments to an
+	/// invoice we do not hold the preimage for, would stay in the payment store for good and be
+	/// read back on every full listing. Nothing else refers to it: `fail_for_id` has already failed
+	/// the HTLCs back (ldk-node's `HTLCHandlingFailed` handling does not look payments up), and the
+	/// payment never appears in our history. If LDK offers the same HTLCs again, ldk-node records
+	/// them afresh under the same id. If instead only our handling of this event is replayed after
+	/// a restart, `fail_for_id` no longer finds the record and logs an error; should the failure
+	/// not have been persisted by then, LDK still fails the HTLCs back itself before they expire.
 	fn fail_claimable_payment(&self, payment_id: LdkPaymentId, payment_hash: PaymentHash) {
 		if let Err(e) = self.ldk_node.bolt11_payment().fail_for_id(payment_id) {
 			log_error!(self.logger, "Failed to fail back claimable payment {payment_hash}: {e}");
+			return;
+		}
+		if let Err(e) = self.ldk_node.remove_payment(&payment_id) {
+			log_error!(
+				self.logger,
+				"Failed to remove the record of failed-back payment {payment_id} for {payment_hash}: {e}"
+			);
 		}
 	}
 
