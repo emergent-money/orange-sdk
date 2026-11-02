@@ -33,6 +33,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// An ldk-node event for the test logs, without a `PaymentSuccessful`'s preimage, which its
+/// `Debug` would show.
+fn event_line(event: &ldk_node::Event) -> String {
+	match event {
+		ldk_node::Event::PaymentSuccessful { payment_id, payment_hash, fee_paid_msat, .. } => {
+			format!(
+				"PaymentSuccessful {{ payment_id: {payment_id}, payment_hash: {payment_hash}, \
+				 fee_paid_msat: {fee_paid_msat:?} }}"
+			)
+		},
+		_ => format!("{event:?}"),
+	}
+}
+
 /// Lists every payment `node` has stored, newest first, walking all pages of
 /// [`Node::list_payments`]. Panics if the payment store cannot be read.
 pub fn list_all_payments(node: &Node) -> Vec<PaymentDetails> {
@@ -220,7 +234,7 @@ fn create_lsp(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	tokio::spawn(async move {
 		loop {
 			let event = events_ref.next_event_async().await;
-			println!("LSP: {event:?}");
+			println!("LSP: {}", event_line(&event));
 			if let Err(e) = events_ref.event_handled() {
 				eprintln!("Error handling LSP ldk event: {e}");
 			}
@@ -266,7 +280,7 @@ fn create_third_party(uuid: Uuid, bitcoind: &Bitcoind) -> Arc<Node> {
 	tokio::spawn(async move {
 		loop {
 			let event = events_ref.next_event_async().await;
-			println!("3rd party: {event:?}");
+			println!("3rd party: {}", event_line(&event));
 			if let Err(e) = events_ref.event_handled() {
 				eprintln!("Error handling LSP ldk event: {e}");
 			}
