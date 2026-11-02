@@ -2937,8 +2937,11 @@ async fn test_wrapped_receive_lightning_leg() {
 			.await;
 			let elapsed = start.elapsed();
 			info!("unknown leg attempt {attempt} failed back after {elapsed:?}");
+			// "Promptly", not a protocol constant: well below any HTLC timeout, with room for a
+			// loaded machine (1.6-2.6 s when idle, over 12 s seen under load) and for the
+			// payer-side polling in `wait_for_condition`.
 			assert!(
-				elapsed < Duration::from_secs(10),
+				elapsed < Duration::from_secs(30),
 				"attempt {attempt} took {elapsed:?} to be failed back"
 			);
 		}
