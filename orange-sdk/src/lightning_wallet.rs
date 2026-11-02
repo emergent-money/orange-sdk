@@ -366,6 +366,25 @@ impl LightningWallet {
 		}
 	}
 
+	/// Test only: makes [`Self::inbound_receipt`] find every payment through the payment-store
+	/// search, as after a restart, by forgetting the ids the event handler recorded.
+	#[cfg(feature = "_test-utils")]
+	pub(crate) fn forget_inbound_payment_ids_for_tests(&self) {
+		self.inner.inbound_payment_ids.forget_for_tests();
+	}
+
+	/// Test only: the id of the received inbound payment for `payment_hash`, as
+	/// `await_payment_receipt` would find it.
+	#[cfg(feature = "_test-utils")]
+	pub(crate) fn received_payment_id_for_tests(
+		&self, payment_hash: PaymentHash,
+	) -> Result<Option<PaymentId>, NodeError> {
+		Ok(match self.inbound_receipt(payment_hash)? {
+			InboundReceipt::Received(payment) => Some(payment.id),
+			InboundReceipt::Failed | InboundReceipt::NotYet => None,
+		})
+	}
+
 	/// Lists every payment in the node's payment store, newest first, walking all its pages.
 	///
 	/// The store keeps only recently used payments in memory, so this reads the rest from the
@@ -875,6 +894,10 @@ async fn await_inbound_receipt<W: ReceiptWatch>(
 #[derive(Default)]
 pub(crate) struct InboundPaymentIds {
 	ids: Mutex<HashMap<PaymentHash, PaymentId>>,
+	/// Test only: once set, no id is known, so every lookup takes the payment-store search, as
+	/// after a restart.
+	#[cfg(feature = "_test-utils")]
+	forgotten: std::sync::atomic::AtomicBool,
 }
 
 impl InboundPaymentIds {
@@ -892,7 +915,18 @@ impl InboundPaymentIds {
 	}
 
 	pub(crate) fn get(&self, payment_hash: &PaymentHash) -> Option<PaymentId> {
+		#[cfg(feature = "_test-utils")]
+		if self.forgotten.load(std::sync::atomic::Ordering::SeqCst) {
+			return None;
+		}
 		self.ids.lock().unwrap().get(payment_hash).copied()
+	}
+
+	/// Test only: forgets every id, now and from now on.
+	#[cfg(feature = "_test-utils")]
+	pub(crate) fn forget_for_tests(&self) {
+		self.forgotten.store(true, std::sync::atomic::Ordering::SeqCst);
+		self.ids.lock().unwrap().clear();
 	}
 }
 

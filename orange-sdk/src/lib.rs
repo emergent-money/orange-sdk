@@ -1336,6 +1336,25 @@ impl Wallet {
 		Ok(Some((payment_hash, invoice)))
 	}
 
+	/// Test only: from now on, look up every received Lightning payment through the payment-store
+	/// search (as after a restart) instead of the ids recorded from `PaymentReceived` events.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn forget_inbound_payment_ids_for_tests(&self) {
+		self.inner.ln_wallet.forget_inbound_payment_ids_for_tests();
+	}
+
+	/// Test only: the id of the received Lightning payment for `payment_hash`, found the way the
+	/// rebalancer's wait for a payment finds it; `None` if none was received.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn received_lightning_payment_id_for_tests(
+		&self, payment_hash: PaymentHash,
+	) -> Result<Option<PaymentId>, WalletError> {
+		let id = self.inner.ln_wallet.received_payment_id_for_tests(payment_hash)?;
+		Ok(id.map(|id| PaymentId::SelfCustodial(id.0)))
+	}
+
 	/// Test only: how many inbound BOLT 11 payment records for `payment_hash` this node's payment
 	/// store holds, as `(failed, pending, succeeded)`.
 	#[cfg(feature = "_test-utils")]

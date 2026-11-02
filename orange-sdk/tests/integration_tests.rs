@@ -384,10 +384,25 @@ async fn test_pay_mpp_trusted_and_lightning() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln() {
-	test_utils::run_test(|params| async move {
+	run_test_sweep_to_ln(false).await;
+}
+
+/// The same sweep with the event handler's hash-to-id map ignored, so the rebalancer's wait can
+/// find the received rebalance payment only through the payment-store search.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_sweep_to_ln_through_payment_store_search() {
+	run_test_sweep_to_ln(true).await;
+}
+
+async fn run_test_sweep_to_ln(forget_inbound_payment_ids: bool) {
+	test_utils::run_test(move |params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let lsp = Arc::clone(&params.lsp);
 		let third_party = Arc::clone(&params.third_party);
+		if forget_inbound_payment_ids {
+			wallet.forget_inbound_payment_ids_for_tests();
+		}
 
 		let starting_bal = wallet.get_balance().await.unwrap();
 		assert_eq!(starting_bal.available_balance(), Amount::ZERO);
@@ -2862,6 +2877,17 @@ async fn test_wrapped_receive_lightning_leg() {
 		assert!(!tx.outbound);
 		assert_eq!(tx.amount, Some(amount));
 		assert_eq!(wallet.inbound_payment_records_for_tests(hash).unwrap(), (0, 0, 1));
+		// Found by its hash under the same id, also through the payment-store search alone (as
+		// after a restart, when no `PaymentReceived` has been seen for it).
+		assert_eq!(
+			wallet.received_lightning_payment_id_for_tests(hash).unwrap(),
+			Some(received_id)
+		);
+		wallet.forget_inbound_payment_ids_for_tests();
+		assert_eq!(
+			wallet.received_lightning_payment_id_for_tests(hash).unwrap(),
+			Some(received_id)
+		);
 
 		// 2. A for-hash invoice we hold no preimage for: failed back promptly on every attempt,
 		// with no record left behind and nothing surfaced.
