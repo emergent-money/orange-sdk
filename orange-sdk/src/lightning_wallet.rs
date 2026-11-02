@@ -371,6 +371,19 @@ impl LightningWallet {
 		}
 	}
 
+	/// Test only: fails back `payment_id` as a refused `PaymentClaimable` would.
+	#[cfg(feature = "_test-utils")]
+	pub(crate) fn fail_back_claimable_for_tests(
+		&self, payment_id: PaymentId, payment_hash: PaymentHash,
+	) {
+		crate::event::fail_back_claimable(
+			&self.inner.ldk_node,
+			payment_id,
+			payment_hash,
+			&self.inner.logger,
+		);
+	}
+
 	/// Test only: makes [`Self::inbound_receipt`] find every payment through the payment-store
 	/// search, as after a restart, by forgetting the ids the event handler recorded.
 	#[cfg(feature = "_test-utils")]

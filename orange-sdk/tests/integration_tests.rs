@@ -2889,6 +2889,14 @@ async fn test_wrapped_receive_lightning_leg() {
 			Some(received_id)
 		);
 
+		// A `PaymentClaimable` replayed after the leg was received, and decided against (say the
+		// trusted wallet failed to initialize), must leave the received payment alone.
+		wallet.fail_back_claimable_payment_for_tests(received_id, hash);
+		assert_eq!(wallet.inbound_payment_records_for_tests(hash).unwrap(), (0, 0, 1));
+		let txs = wallet.list_transactions().await.unwrap();
+		let tx = txs.iter().find(|t| t.id == received_id).expect("the leg is still in history");
+		assert_eq!(tx.status, TxStatus::Completed);
+
 		// 2. A for-hash invoice we hold no preimage for: failed back promptly on every attempt,
 		// with no record left behind and nothing surfaced.
 		let (unknown_hash, unknown_invoice) = wallet

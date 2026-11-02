@@ -12,9 +12,11 @@ use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
 use ldk_node::lightning::util::ser::{Writeable, Writer};
-use ldk_node::lightning::{impl_writeable_tlv_based_enum, log_debug, log_error, log_warn};
+use ldk_node::lightning::{
+	impl_writeable_tlv_based_enum, log_debug, log_error, log_info, log_warn,
+};
 use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
-use ldk_node::payment::{ConfirmationStatus, PaymentKind};
+use ldk_node::payment::{ConfirmationStatus, PaymentKind, PaymentStatus};
 use ldk_node::{CustomTlvRecord, UserChannelId};
 
 use std::collections::{HashMap, VecDeque};
@@ -936,29 +938,8 @@ impl LdkEventHandler {
 		}
 	}
 
-	/// Fails a claimable payment back, then removes the record ldk-node made for it.
-	///
-	/// ldk-node creates that record when the HTLCs arrive (we enable
-	/// `manually_handle_unknown_bolt11_payments`) and `fail_for_id` only marks it failed, so
-	/// without the removal every payment we refuse, including any number of payments to an
-	/// invoice we do not hold the preimage for, would stay in the payment store for good and be
-	/// read back on every full listing. Nothing else refers to it: `fail_for_id` has already failed
-	/// the HTLCs back (ldk-node's `HTLCHandlingFailed` handling does not look payments up), and the
-	/// payment never appears in our history. If LDK offers the same HTLCs again, ldk-node records
-	/// them afresh under the same id. If instead only our handling of this event is replayed after
-	/// a restart, `fail_for_id` no longer finds the record and logs an error; should the failure
-	/// not have been persisted by then, LDK still fails the HTLCs back itself before they expire.
 	fn fail_claimable_payment(&self, payment_id: LdkPaymentId, payment_hash: PaymentHash) {
-		if let Err(e) = self.ldk_node.bolt11_payment().fail_for_id(payment_id) {
-			log_error!(self.logger, "Failed to fail back claimable payment {payment_hash}: {e}");
-			return;
-		}
-		if let Err(e) = self.ldk_node.remove_payment(&payment_id) {
-			log_error!(
-				self.logger,
-				"Failed to remove the record of failed-back payment {payment_id} for {payment_hash}: {e}"
-			);
-		}
+		fail_back_claimable(&self.ldk_node, payment_id, payment_hash, &self.logger);
 	}
 
 	/// Reserve a `PendingRebalance` metadata slot for a freshly broadcast channel or splice
@@ -982,5 +963,59 @@ impl LdkEventHandler {
 				},
 			)
 			.await;
+	}
+}
+
+/// Fails a claimable payment back, then removes the record ldk-node made for it.
+///
+/// ldk-node creates that record when the HTLCs arrive (we enable
+/// `manually_handle_unknown_bolt11_payments`) and `fail_for_id` only marks it failed, so
+/// without the removal every payment we refuse, including any number of payments to an
+/// invoice we do not hold the preimage for, would stay in the payment store for good and be
+/// read back on every full listing. Nothing else refers to it: `fail_for_id` has already failed
+/// the HTLCs back (ldk-node's `HTLCHandlingFailed` handling does not look payments up), and the
+/// payment never appears in our history. If LDK offers the same HTLCs again, ldk-node records
+/// them afresh under the same id. If instead only our handling of this event is replayed after
+/// a restart, `fail_for_id` no longer finds the record and logs an error; should the failure
+/// not have been persisted by then, LDK still fails the HTLCs back itself before they expire.
+///
+/// A payment already recorded as received is left alone. `fail_for_id` and `remove_payment` check
+/// no status, and a `PaymentClaimable` replayed after a restart for a payment we did claim can
+/// still be decided against (the trusted wallet not initialized, a store error), which would
+/// otherwise mark the received payment failed and delete it.
+pub(crate) fn fail_back_claimable(
+	node: &ldk_node::Node, payment_id: LdkPaymentId, payment_hash: PaymentHash, logger: &Logger,
+) {
+	match node.payment(&payment_id) {
+		Ok(Some(payment)) if payment.status == PaymentStatus::Succeeded => {
+			log_info!(
+				logger,
+				"Not failing back payment {payment_id} for {payment_hash}: it was already received"
+			);
+			return;
+		},
+		Ok(_) => {},
+		Err(e) => {
+			// We cannot tell whether it was received: fail it back, as before the record
+			// removal, but keep its record.
+			log_error!(
+				logger,
+				"Failed to read claimable payment {payment_id} for {payment_hash}, failing it back without removing its record: {e}"
+			);
+			if let Err(e) = node.bolt11_payment().fail_for_id(payment_id) {
+				log_error!(logger, "Failed to fail back claimable payment {payment_hash}: {e}");
+			}
+			return;
+		},
+	}
+	if let Err(e) = node.bolt11_payment().fail_for_id(payment_id) {
+		log_error!(logger, "Failed to fail back claimable payment {payment_hash}: {e}");
+		return;
+	}
+	if let Err(e) = node.remove_payment(&payment_id) {
+		log_error!(
+			logger,
+			"Failed to remove the record of failed-back payment {payment_id} for {payment_hash}: {e}"
+		);
 	}
 }

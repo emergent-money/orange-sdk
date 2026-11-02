@@ -1357,6 +1357,22 @@ impl Wallet {
 		self.inner.trusted.fail_next_payments_for_tests(count);
 	}
 
+	/// Test only: fails back the self-custodial payment `payment_id` to `payment_hash` as a refused
+	/// `PaymentClaimable` would, for instance one replayed after a restart.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn fail_back_claimable_payment_for_tests(
+		&self, payment_id: PaymentId, payment_hash: PaymentHash,
+	) {
+		let PaymentId::SelfCustodial(id) = payment_id else {
+			panic!("only self-custodial payments are claimable");
+		};
+		self.inner.ln_wallet.fail_back_claimable_for_tests(
+			ldk_node::lightning::ln::channelmanager::PaymentId(id),
+			payment_hash,
+		);
+	}
+
 	/// Test only: from now on, look up every received Lightning payment through the payment-store
 	/// search (as after a restart) instead of the ids recorded from `PaymentReceived` events.
 	#[cfg(feature = "_test-utils")]
