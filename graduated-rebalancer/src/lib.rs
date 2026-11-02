@@ -12,13 +12,18 @@ use bitcoin_payment_instructions::PaymentMethod;
 use lightning::bitcoin::hex::DisplayHex;
 use lightning::bitcoin::OutPoint;
 use lightning::util::logger::Logger;
-use lightning::{log_debug, log_error, log_info};
+use lightning::{log_debug, log_error, log_info, log_warn};
 use lightning_invoice::Bolt11Invoice;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn duration_to_millis(duration: Duration) -> u64 {
+	u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// How long after the expiry of a rebalance invoice the rebalancer still waits for the payment to
 /// it to be received.
@@ -67,6 +72,13 @@ pub struct RebalanceTunables {
 	///
 	/// This avoids unnecessary transfers and fees.
 	pub rebalance_min: Amount,
+	/// How long the rebalancer still waits for the Lightning receipt of a rebalance payment after
+	/// the trusted wallet reported that payment failed.
+	///
+	/// A trusted wallet can report a failure after our node already received the payment (Breez
+	/// reports a Spark send as failed when the operator gets no preimage back, which happens after
+	/// our node released it), and our event handling may not have recorded the receipt yet.
+	pub trusted_failure_receipt_grace: Duration,
 }
 
 impl Default for RebalanceTunables {
@@ -74,6 +86,7 @@ impl Default for RebalanceTunables {
 		Self {
 			trusted_balance_limit: Amount::from_sats(100_000).expect("valid amount"),
 			rebalance_min: Amount::from_sats(5_000).expect("valid amount"),
+			trusted_failure_receipt_grace: Duration::from_secs(60),
 		}
 	}
 }
@@ -263,6 +276,9 @@ pub struct GraduatedRebalancer<
 	event_handler: Arc<E>,
 	logger: Arc<O>,
 
+	/// [`RebalanceTunables::trusted_failure_receipt_grace`], in milliseconds.
+	trusted_failure_receipt_grace_ms: AtomicU64,
+
 	/// Mutex to ensure thread-safe balance operations.
 	balance_mutex: tokio::sync::Mutex<()>,
 }
@@ -276,8 +292,13 @@ where
 	L: Logger,
 {
 	/// Create a new graduated rebalancer
+	///
+	/// Of `tunables` the rebalancer itself uses only
+	/// [`RebalanceTunables::trusted_failure_receipt_grace`]; the balance thresholds are the
+	/// trigger's to apply.
 	pub fn new(
-		trusted: Arc<T>, ln_wallet: Arc<LN>, trigger: Arc<R>, event_handler: Arc<E>, logger: Arc<L>,
+		trusted: Arc<T>, ln_wallet: Arc<LN>, trigger: Arc<R>, event_handler: Arc<E>,
+		logger: Arc<L>, tunables: RebalanceTunables,
 	) -> Self {
 		Self {
 			trusted,
@@ -285,8 +306,17 @@ where
 			trigger,
 			event_handler,
 			logger,
+			trusted_failure_receipt_grace_ms: AtomicU64::new(duration_to_millis(
+				tunables.trusted_failure_receipt_grace,
+			)),
 			balance_mutex: tokio::sync::Mutex::new(()),
 		}
+	}
+
+	/// Changes [`RebalanceTunables::trusted_failure_receipt_grace`] for rebalances that start
+	/// from now on.
+	pub fn set_trusted_failure_receipt_grace(&self, grace: Duration) {
+		self.trusted_failure_receipt_grace_ms.store(duration_to_millis(grace), Ordering::Relaxed);
 	}
 
 	/// Does any rebalance if it meets the conditions of the tunables
@@ -372,23 +402,44 @@ where
 					// reports the payment failed: then no receipt is coming, and waiting until
 					// the receipt's deadline would hold `balance_mutex`, blocking every other
 					// rebalance, for as long as the invoice is valid.
-					let receipt =
+					let mut receipt =
 						self.ln_wallet.await_payment_receipt(expected_hash.0, receipt_deadline);
 					let trusted_failure = self.trusted.await_payment_failure(expected_hash.0);
-					let ln_payment = tokio::select! {
+					let receipt = tokio::select! {
 						biased;
-						receipt = receipt => match receipt {
-							Some(receipt) => receipt,
-							None => {
-								log_error!(self.logger, "Failed to receive rebalance payment!");
-								return;
-							},
-						},
+						receipt = &mut receipt => receipt,
 						() = trusted_failure => {
-							log_error!(
-								self.logger,
-								"Rebalance payment failed on the trusted side; no Lightning receipt expected"
+							// The failure may have been reported after our node received the
+							// payment, before the receipt was recorded: allow the receipt a grace.
+							let grace = Duration::from_millis(
+								self.trusted_failure_receipt_grace_ms.load(Ordering::Relaxed),
 							);
+							log_warn!(
+								self.logger,
+								"Rebalance payment failed on the trusted side; waiting up to {grace:?} for a Lightning receipt in case it was received anyway"
+							);
+							match tokio::time::timeout(grace, &mut receipt).await {
+								Ok(Some(receipt)) => {
+									log_warn!(
+										self.logger,
+										"Rebalance payment was received although the trusted side reported it failed"
+									);
+									Some(receipt)
+								},
+								Ok(None) | Err(_) => {
+									log_error!(
+										self.logger,
+										"Rebalance payment failed on the trusted side; no Lightning receipt expected"
+									);
+									return;
+								},
+							}
+						},
+					};
+					let ln_payment = match receipt {
+						Some(receipt) => receipt,
+						None => {
+							log_error!(self.logger, "Failed to receive rebalance payment!");
 							return;
 						},
 					};
@@ -504,6 +555,182 @@ mod tests {
 			.min_final_cltv_expiry_delta(144)
 			.build_signed(|msg| secp.sign_ecdsa_recoverable(msg, &key))
 			.unwrap()
+	}
+
+	struct NoLogger;
+	impl Logger for NoLogger {
+		fn log(&self, _record: lightning::util::logger::Record) {}
+	}
+
+	/// A trusted wallet whose rebalance payment reports failure after `fail_after`, if set.
+	struct MockTrusted {
+		fail_after: Option<Duration>,
+	}
+
+	impl TrustedWallet for MockTrusted {
+		type Error = ();
+		fn get_balance(&self) -> Pin<Box<dyn Future<Output = Result<Amount, ()>> + Send + '_>> {
+			Box::pin(async { Ok(Amount::from_sats(200_000).unwrap()) })
+		}
+		fn get_bolt11_invoice(
+			&self, _amount: Option<Amount>,
+		) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, ()>> + Send + '_>> {
+			unimplemented!()
+		}
+		fn pay(
+			&self, _method: PaymentMethod, _amount: Amount,
+		) -> Pin<Box<dyn Future<Output = Result<[u8; 32], ()>> + Send + '_>> {
+			Box::pin(async { Ok([1; 32]) })
+		}
+		fn estimate_fee(
+			&self, _method: PaymentMethod, _amount: Amount,
+		) -> Pin<Box<dyn Future<Output = Result<Amount, ()>> + Send + '_>> {
+			Box::pin(async { Ok(Amount::ZERO) })
+		}
+		fn await_payment_success(
+			&self, _payment_hash: [u8; 32],
+		) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
+			Box::pin(async { Some(ReceivedLightningPayment { id: [1; 32], fee_paid_msat: None }) })
+		}
+		fn await_payment_failure(
+			&self, _payment_hash: [u8; 32],
+		) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+			let fail_after = self.fail_after;
+			Box::pin(async move {
+				match fail_after {
+					Some(after) => tokio::time::sleep(after).await,
+					None => std::future::pending().await,
+				}
+			})
+		}
+	}
+
+	/// A Lightning wallet whose rebalance payment is received after `receipt_after`, if set.
+	struct MockLightning {
+		receipt_after: Option<Duration>,
+	}
+
+	impl LightningWallet for MockLightning {
+		type Error = ();
+		fn get_balance(&self) -> LightningBalance {
+			unimplemented!()
+		}
+		fn get_bolt11_invoice(
+			&self, _amount: Option<Amount>,
+		) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, ()>> + Send + '_>> {
+			Box::pin(async { Ok(invoice(Duration::from_secs(3_600))) })
+		}
+		fn pay(
+			&self, _method: PaymentMethod, _amount: Amount,
+		) -> Pin<Box<dyn Future<Output = Result<[u8; 32], ()>> + Send + '_>> {
+			unimplemented!()
+		}
+		fn await_payment_receipt(
+			&self, _payment_hash: [u8; 32], _deadline: Duration,
+		) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
+			let receipt_after = self.receipt_after;
+			Box::pin(async move {
+				match receipt_after {
+					Some(after) => {
+						tokio::time::sleep(after).await;
+						Some(ReceivedLightningPayment { id: [2; 32], fee_paid_msat: None })
+					},
+					None => std::future::pending().await,
+				}
+			})
+		}
+		fn has_channel_with_lsp(&self) -> bool {
+			unimplemented!()
+		}
+		fn open_channel_with_lsp(
+			&self,
+		) -> Pin<Box<dyn Future<Output = Result<u128, ()>> + Send + '_>> {
+			unimplemented!()
+		}
+		fn await_channel_pending(
+			&self, _channel_id: u128,
+		) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+			unimplemented!()
+		}
+		fn splice_to_lsp_channel(
+			&self,
+		) -> Pin<Box<dyn Future<Output = Result<u128, ()>> + Send + '_>> {
+			unimplemented!()
+		}
+		fn await_splice_pending(
+			&self, _channel_id: u128,
+		) -> Pin<Box<dyn Future<Output = OutPoint> + Send + '_>> {
+			unimplemented!()
+		}
+	}
+
+	struct AlwaysTrusted;
+	impl RebalanceTrigger for AlwaysTrusted {
+		fn needs_trusted_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
+			async {
+				Some(TriggerParams { id: [3; 32], amount: Amount::from_sats(150_000).unwrap() })
+			}
+		}
+		fn needs_onchain_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
+			async { None }
+		}
+	}
+
+	#[derive(Default)]
+	struct Events(std::sync::Mutex<Vec<RebalancerEvent>>);
+	impl EventHandler for Events {
+		fn handle_event(
+			&self, event: RebalancerEvent,
+		) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+			self.0.lock().unwrap().push(event);
+			Box::pin(async {})
+		}
+	}
+
+	/// Runs one trusted rebalance; returns how long it took and whether it succeeded.
+	async fn rebalance(
+		fail_after: Option<Duration>, receipt_after: Option<Duration>,
+	) -> (Duration, bool) {
+		let events = Arc::new(Events::default());
+		let rebalancer = GraduatedRebalancer::new(
+			Arc::new(MockTrusted { fail_after }),
+			Arc::new(MockLightning { receipt_after }),
+			Arc::new(AlwaysTrusted),
+			Arc::clone(&events),
+			Arc::new(NoLogger),
+			RebalanceTunables::default(),
+		);
+		let start = tokio::time::Instant::now();
+		rebalancer.do_trusted_rebalance_if_needed().await;
+		let events = events.0.lock().unwrap();
+		assert!(matches!(events.first(), Some(RebalancerEvent::RebalanceInitiated { .. })));
+		let succeeded = matches!(events.get(1), Some(RebalancerEvent::RebalanceSuccessful { .. }));
+		assert_eq!(events.len(), if succeeded { 2 } else { 1 });
+		(start.elapsed(), succeeded)
+	}
+
+	/// A trusted failure with no receipt ends the rebalance once the grace is over.
+	#[tokio::test(start_paused = true)]
+	async fn trusted_failure_ends_the_rebalance_after_the_grace() {
+		let secs = Duration::from_secs;
+		assert_eq!(rebalance(Some(secs(1)), None).await, (secs(61), false));
+	}
+
+	/// A receipt within the grace after a trusted failure completes the rebalance as usual, so it
+	/// is recorded rather than shown as fresh income.
+	#[tokio::test(start_paused = true)]
+	async fn a_receipt_within_the_grace_after_a_trusted_failure_completes_the_rebalance() {
+		let secs = Duration::from_secs;
+		assert_eq!(rebalance(Some(secs(1)), Some(secs(30))).await, (secs(30), true));
+		// Past the grace it is too late.
+		assert_eq!(rebalance(Some(secs(1)), Some(secs(62))).await, (secs(61), false));
+	}
+
+	/// Without a trusted failure the receipt completes the rebalance, however long it takes.
+	#[tokio::test(start_paused = true)]
+	async fn a_receipt_without_a_trusted_failure_completes_the_rebalance() {
+		let secs = Duration::from_secs;
+		assert_eq!(rebalance(None, Some(secs(600))).await, (secs(600), true));
 	}
 
 	/// The wait for a rebalance payment ends two hours after its invoice expires, when LDK stops

@@ -18,7 +18,7 @@ use crate::trusted_wallet::dummy::DummyTrustedWallet;
 #[cfg(feature = "spark")]
 use crate::trusted_wallet::spark::Spark;
 use crate::trusted_wallet::{DynTrustedWalletInterface, WalletTrusted};
-use graduated_rebalancer::GraduatedRebalancer;
+use graduated_rebalancer::{GraduatedRebalancer, RebalanceTunables};
 use ldk_node::bitcoin::Network;
 use ldk_node::bitcoin::hashes::{Hash, sha256};
 use ldk_node::bitcoin::io;
@@ -785,6 +785,11 @@ impl Wallet {
 			trigger,
 			rebalance_events,
 			Arc::clone(&logger),
+			RebalanceTunables {
+				trusted_balance_limit: tunables.trusted_balance_limit,
+				rebalance_min: tunables.rebalance_min,
+				..RebalanceTunables::default()
+			},
 		));
 
 		// Spawn a background thread to initiate a rebalance if needed.
@@ -1334,6 +1339,14 @@ impl Wallet {
 				.map_err(|_| WalletError::LdkNodeFailure(NodeError::PersistenceFailed))?;
 		}
 		Ok(Some((payment_hash, invoice)))
+	}
+
+	/// Test only: how long the rebalancer still waits for a rebalance payment's Lightning receipt
+	/// after the trusted wallet reported the payment failed (60 s by default).
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn set_trusted_failure_receipt_grace_for_tests(&self, grace: Duration) {
+		self.inner.rebalancer.set_trusted_failure_receipt_grace(grace);
 	}
 
 	/// Test only: makes the trusted wallet's next `count` BOLT 11 payments fail on their way. Only

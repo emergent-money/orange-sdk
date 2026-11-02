@@ -2944,6 +2944,9 @@ async fn test_failed_trusted_rebalance_payment_releases_the_rebalancer() {
 	test_utils::run_test(|params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let third_party = Arc::clone(&params.third_party);
+		// After the failure, the rebalancer waits this long for a receipt in case the payment
+		// landed anyway (60 s by default).
+		wallet.set_trusted_failure_receipt_grace_for_tests(Duration::from_secs(1));
 
 		// Half the trusted limit: no rebalance yet.
 		let limit = wallet.get_tunables().trusted_balance_limit;
