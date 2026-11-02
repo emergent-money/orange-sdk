@@ -596,7 +596,7 @@ async fn execute_command(command: Commands, state: &mut WalletState) -> Result<(
 								i + 1,
 								status_icon,
 								direction_icon,
-								format!("{:?}", tx.payment_type).bright_cyan(),
+								payment_type_name(&tx.payment_type).bright_cyan(),
 								tx.amount
 									.map(|a| a.sats_rounding_up().to_string())
 									.unwrap_or_else(|| "?".to_string())
@@ -830,4 +830,17 @@ fn generate_or_load_seed(storage_path: &str) -> Result<Seed> {
 	);
 
 	Ok(Seed::Mnemonic { mnemonic, passphrase: None })
+}
+
+/// The kind of a payment, without its details: an outgoing Lightning payment's carry its
+/// preimage, which must never be printed.
+fn payment_type_name(payment_type: &orange_sdk::PaymentType) -> &'static str {
+	match payment_type {
+		orange_sdk::PaymentType::OutgoingLightningBolt12 { .. } => "OutgoingLightningBolt12",
+		orange_sdk::PaymentType::OutgoingLightningBolt11 { .. } => "OutgoingLightningBolt11",
+		orange_sdk::PaymentType::OutgoingOnChain { .. } => "OutgoingOnChain",
+		orange_sdk::PaymentType::IncomingOnChain { .. } => "IncomingOnChain",
+		orange_sdk::PaymentType::IncomingLightning { .. } => "IncomingLightning",
+		orange_sdk::PaymentType::TrustedInternal { .. } => "TrustedInternal",
+	}
 }

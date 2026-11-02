@@ -909,8 +909,6 @@ mod tests {
 		}
 	}
 
-	/// The condition `await_payment_failure` (and, after a receipt, `await_payment_success`)
-	/// acts on: only a definite failure of our send counts.
 	/// The log summary of a payment never includes its preimage.
 	#[test]
 	fn payment_summary_omits_the_preimage() {
@@ -925,6 +923,8 @@ mod tests {
 		assert!(!summary.contains(&preimage));
 	}
 
+	/// The condition `await_payment_failure` (and, after a receipt, `await_payment_success`)
+	/// acts on: only a definite failure of our send counts.
 	#[test]
 	fn spark_send_failure_condition() {
 		let hash = [0x44; 32];
