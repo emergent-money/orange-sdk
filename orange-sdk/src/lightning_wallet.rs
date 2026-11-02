@@ -93,8 +93,21 @@ impl LightningWallet {
 			enable_zero_fee_commitments: true,
 			..Default::default()
 		};
-		let ldk_node_config =
-			ldk_node::config::Config { anchor_channels_config, ..Default::default() };
+		let ldk_node_config = ldk_node::config::Config {
+			anchor_channels_config,
+			// The Lightning leg of a wrapped receive is a `receive_for_hash` invoice whose preimage
+			// orange-sdk holds, not ldk-node. Since lightningdevkit/ldk-node#948 creating such an
+			// invoice no longer stores a payment record, so when it is paid ldk-node knows neither the
+			// payment nor its preimage, and with this flag off it fails the HTLCs back on arrival
+			// without emitting `Event::PaymentClaimable`: every Lightning leg would be refused. With
+			// it on, ldk-node records the payment and emits the event, and `LdkEventHandler` claims
+			// it (only a known wrapped receive, for at least its amount, whose trusted leg is unpaid)
+			// or fails it back at once. Failing back at once also bounds ldk-node's warning about
+			// this flag: a payer holding one of our invoices cannot keep HTLC slots held for longer
+			// than it takes us to handle the event.
+			manually_handle_unknown_bolt11_payments: true,
+			..Default::default()
+		};
 		let mut builder = ldk_node::Builder::from_config(ldk_node_config);
 		builder.set_network(config.network);
 		let node_entropy = config.seed.to_node_entropy();
