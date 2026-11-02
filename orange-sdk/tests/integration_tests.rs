@@ -2810,3 +2810,100 @@ async fn test_lsp_connectivity_fallback() {
 	})
 	.await;
 }
+
+/// The Lightning leg of a wrapped receive on ldk-node with LDK-derived inbound payment ids
+/// (ldk-node #948): a leg we hold the preimage for is claimed (which needs
+/// `manually_handle_unknown_bolt11_payments`: without it ldk-node refuses the payment on arrival),
+/// recorded under an id that is not its payment hash, and shown in history as a completed
+/// incoming Lightning payment; a for-hash invoice we hold no preimage for is failed back
+/// promptly on every attempt, and leaves no payment record behind.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_wrapped_receive_lightning_leg() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let third_party = Arc::clone(&params.third_party);
+		open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
+
+		// 1. A leg we hold the preimage for is claimed.
+		let amount = Amount::from_sats(10_000).unwrap();
+		let (hash, invoice) = wallet
+			.wrapped_receive_lightning_leg_for_tests(amount, true)
+			.await
+			.unwrap()
+			.expect("the channel can take the leg");
+		let pid = third_party.bolt11_payment().send(&invoice, None).unwrap();
+		let tp = Arc::clone(&third_party);
+		test_utils::wait_for_condition("payer success on the known leg", || {
+			let res = tp
+				.payment(&pid)
+				.expect("payment store read")
+				.is_some_and(|p| p.status == PaymentStatus::Succeeded);
+			async move { res }
+		})
+		.await;
+
+		let received_id = match wait_next_event(&wallet).await {
+			Event::PaymentReceived { payment_id, payment_hash, amount_msat, .. } => {
+				assert_eq!(payment_hash, hash);
+				assert_eq!(amount_msat, amount.milli_sats());
+				assert!(matches!(payment_id, orange_sdk::PaymentId::SelfCustodial(_)));
+				// Recorded under the id LDK derives from the HTLCs, not the payment hash.
+				assert_ne!(payment_id, orange_sdk::PaymentId::SelfCustodial(hash.0));
+				payment_id
+			},
+			e => panic!("Expected PaymentReceived, got {e:?}"),
+		};
+
+		let txs = wallet.list_transactions().await.unwrap();
+		let tx = txs.iter().find(|t| t.id == received_id).expect("the leg is in history");
+		assert_eq!(tx.status, TxStatus::Completed);
+		assert_eq!(tx.payment_type, PaymentType::IncomingLightning {});
+		assert!(!tx.outbound);
+		assert_eq!(tx.amount, Some(amount));
+		assert_eq!(wallet.inbound_payment_records_for_tests(hash).unwrap(), (0, 0, 1));
+
+		// 2. A for-hash invoice we hold no preimage for: failed back promptly on every attempt,
+		// with no record left behind and nothing surfaced.
+		let (unknown_hash, unknown_invoice) = wallet
+			.wrapped_receive_lightning_leg_for_tests(Amount::from_sats(1_000).unwrap(), false)
+			.await
+			.unwrap()
+			.expect("the channel can take the leg");
+		const ATTEMPTS: usize = 4;
+		for attempt in 1..=ATTEMPTS {
+			let start = std::time::Instant::now();
+			let pid = third_party.bolt11_payment().send(&unknown_invoice, None).unwrap();
+			let tp = Arc::clone(&third_party);
+			test_utils::wait_for_condition("payer failure on the unknown leg", || {
+				let res = tp
+					.payment(&pid)
+					.expect("payment store read")
+					.is_some_and(|p| p.status == PaymentStatus::Failed);
+				async move { res }
+			})
+			.await;
+			let elapsed = start.elapsed();
+			info!("unknown leg attempt {attempt} failed back after {elapsed:?}");
+			assert!(
+				elapsed < Duration::from_secs(10),
+				"attempt {attempt} took {elapsed:?} to be failed back"
+			);
+		}
+		// Each refused payment's record is removed once it is failed back.
+		test_utils::wait_for_condition("failed-back records removed", || async {
+			wallet.inbound_payment_records_for_tests(unknown_hash).unwrap() == (0, 0, 0)
+		})
+		.await;
+
+		let txs = wallet.list_transactions().await.unwrap();
+		assert_eq!(
+			txs.iter().filter(|t| t.payment_type == PaymentType::IncomingLightning {}).count(),
+			2,
+			"only the channel-opening receive and the known leg are in history"
+		);
+		let event = wallet.next_event();
+		assert!(event.is_none(), "No more events expected, got {event:?}");
+	})
+	.await;
+}

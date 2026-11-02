@@ -1308,6 +1308,58 @@ impl Wallet {
 		Ok(WrappedReceive { payment_hash, lightning_invoice, trusted_invoice })
 	}
 
+	/// Test only: the Lightning leg of a [`Self::get_wrapped_receive`] for `amount` without its
+	/// trusted leg, which the dummy trusted wallet cannot create, so tests can pay that leg.
+	///
+	/// With `remember_preimage` the preimage is persisted exactly as `get_wrapped_receive` does, so
+	/// a payment to the invoice is claimed. Without, the invoice is for a hash this wallet holds no
+	/// preimage for, so a payment to it is failed back. `None` if this node cannot receive
+	/// `amount` over its existing channels.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub async fn wrapped_receive_lightning_leg_for_tests(
+		&self, amount: Amount, remember_preimage: bool,
+	) -> Result<Option<(PaymentHash, Bolt11Invoice)>, WalletError> {
+		let created_at_secs =
+			SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+		let (entry, payment_hash) = new_wrapped_receive(amount.milli_sats(), created_at_secs);
+		let Some(invoice) =
+			self.inner.ln_wallet.get_bolt11_invoice_for_hash(amount, payment_hash).await?
+		else {
+			return Ok(None);
+		};
+		if remember_preimage {
+			store::write_wrapped_receive(self.inner.store.as_ref(), &payment_hash, &entry)
+				.await
+				.map_err(|_| WalletError::LdkNodeFailure(NodeError::PersistenceFailed))?;
+		}
+		Ok(Some((payment_hash, invoice)))
+	}
+
+	/// Test only: how many inbound BOLT 11 payment records for `payment_hash` this node's payment
+	/// store holds, as `(failed, pending, succeeded)`.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn inbound_payment_records_for_tests(
+		&self, payment_hash: PaymentHash,
+	) -> Result<(usize, usize, usize), WalletError> {
+		use ldk_node::payment::PaymentStatus;
+		let mut counts = (0, 0, 0);
+		for payment in self.inner.ln_wallet.list_payments()? {
+			let for_hash =
+				matches!(payment.kind, PaymentKind::Bolt11 { hash, .. } if hash == payment_hash);
+			if payment.direction != PaymentDirection::Inbound || !for_hash {
+				continue;
+			}
+			match payment.status {
+				PaymentStatus::Failed => counts.0 += 1,
+				PaymentStatus::Pending => counts.1 += 1,
+				PaymentStatus::Succeeded => counts.2 += 1,
+			}
+		}
+		Ok(counts)
+	}
+
 	/// Parses payment instructions from an arbitrary string provided by a user, scanned from a QR
 	/// code, or read from a link which the user opened with this application.
 	///
