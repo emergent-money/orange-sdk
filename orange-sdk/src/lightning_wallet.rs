@@ -19,7 +19,7 @@ use ldk_node::config::{AsyncPaymentsRole, BackgroundSyncConfig, SyncTimeoutsConf
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::util::logger::Logger as _;
-use ldk_node::lightning::{log_debug, log_error, log_info};
+use ldk_node::lightning::{log_debug, log_error, log_info, log_warn};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::lightning_types::payment::PaymentHash;
 use ldk_node::payment::{
@@ -742,8 +742,8 @@ impl SplicePendingInbox {
 	}
 }
 
-/// How many failed lookups in a row [`await_inbound_receipt`] tolerates before it gives up.
-const MAX_CONSECUTIVE_RECEIPT_ERRORS: u32 = 3;
+/// From this many failed lookups in a row on, [`await_inbound_receipt`] logs them as warnings.
+const RECEIPT_ERRORS_BEFORE_WARN: u32 = 3;
 
 /// After a failed lookup, how long [`await_inbound_receipt`] waits for a wake-up before looking
 /// again anyway: the receipt the failed lookup missed may have been the last wake-up to come.
@@ -789,12 +789,14 @@ impl ReceiptWatch for NodeReceiptWatch<'_> {
 	}
 }
 
-/// Waits until `watch` reports the payment for `payment_hash` received (`Some`) or failed (`None`).
+/// Waits until `watch` reports the payment for `payment_hash` received (`Some`) or failed (`None`),
+/// or no wake-up can come any more (`None`).
 ///
-/// A failed lookup (a payment-store read can now fail) is retried on the next wake-up, up to
-/// [`MAX_CONSECUTIVE_RECEIPT_ERRORS`] in a row. Then we give up with `None`, which the rebalancer
-/// takes as a failed rebalance: the money is not affected, but if the payment did arrive the
-/// rebalance is not recorded as one, so its Lightning leg shows as an ordinary receive.
+/// A failed lookup (a payment-store read can fail since the store became a bounded cache) never
+/// ends the wait: it is logged with a running count and retried on the next wake-up, or after
+/// [`RECEIPT_RETRY_DELAY`] if none comes, for as long as it keeps failing. Giving up would leave
+/// the rebalance unrecorded: its trusted debit hidden as a pending rebalance and its Lightning
+/// receipt shown as ordinary income, so history would overstate income by the rebalance amount.
 async fn await_inbound_receipt<W: ReceiptWatch>(
 	watch: &mut W, payment_hash: PaymentHash, logger: &Logger,
 ) -> Option<PaymentDetails> {
@@ -809,17 +811,17 @@ async fn await_inbound_receipt<W: ReceiptWatch>(
 			},
 			Err(e) => {
 				consecutive_errors += 1;
-				if consecutive_errors >= MAX_CONSECUTIVE_RECEIPT_ERRORS {
-					log_error!(
+				if consecutive_errors >= RECEIPT_ERRORS_BEFORE_WARN {
+					log_warn!(
 						logger,
-						"Giving up waiting for the payment for hash {payment_hash} after {consecutive_errors} failed lookups in a row (last: {e}): if it arrived, the rebalance completed but was not recorded"
+						"Failed to look up the payment for hash {payment_hash} while waiting for it ({consecutive_errors} in a row), will retry: {e}"
 					);
-					return None;
+				} else {
+					log_info!(
+						logger,
+						"Failed to look up the payment for hash {payment_hash} while waiting for it ({consecutive_errors} in a row), will retry: {e}"
+					);
 				}
-				log_error!(
-					logger,
-					"Failed to look up the payment for hash {payment_hash} while waiting for it ({consecutive_errors} in a row), will retry: {e}"
-				);
 				true
 			},
 		};
@@ -1090,6 +1092,8 @@ mod tests {
 	/// A [`ReceiptWatch`] that plays back scripted lookups.
 	struct ScriptedWatch {
 		looks: VecDeque<Result<InboundReceipt, NodeError>>,
+		/// Once the script is used up, fail every lookup instead of panicking.
+		fail_when_unscripted: bool,
 		looked: usize,
 		waits: Vec<bool>,
 		/// Whether wake-ups can still come.
@@ -1098,18 +1102,30 @@ mod tests {
 
 	impl ScriptedWatch {
 		fn new(looks: Vec<Result<InboundReceipt, NodeError>>) -> Self {
-			Self { looks: looks.into(), looked: 0, waits: Vec::new(), alive: true }
+			Self {
+				looks: looks.into(),
+				fail_when_unscripted: false,
+				looked: 0,
+				waits: Vec::new(),
+				alive: true,
+			}
 		}
 	}
 
 	impl ReceiptWatch for ScriptedWatch {
 		fn look(&mut self) -> Result<InboundReceipt, NodeError> {
 			self.looked += 1;
-			self.looks.pop_front().expect("looked more often than scripted")
+			match self.looks.pop_front() {
+				Some(look) => look,
+				None if self.fail_when_unscripted => store_error(),
+				None => panic!("looked more often than scripted"),
+			}
 		}
 
 		async fn wait(&mut self, after_error: bool) -> bool {
 			self.waits.push(after_error);
+			// Yield like a real wait would, so a test can time the loop out.
+			tokio::task::yield_now().await;
 			self.alive
 		}
 	}
@@ -1132,34 +1148,33 @@ mod tests {
 		await_inbound_receipt(watch, PaymentHash(HASH), &logger).await
 	}
 
-	/// The wait survives store errors, but gives up after three failed lookups in a row.
+	/// A store error that never clears never ends the wait: giving up would leave the rebalance
+	/// unrecorded.
 	#[tokio::test]
-	async fn rebalance_wait_gives_up_after_three_consecutive_store_errors() {
-		let mut watch = ScriptedWatch::new(vec![store_error(), store_error(), store_error()]);
-		assert_eq!(run(&mut watch).await, None);
-		assert_eq!(watch.looked, 3);
-		// Each failed lookup but the last was followed by a bounded wait.
-		assert_eq!(watch.waits, vec![true, true]);
-
-		let mut watch = ScriptedWatch::new(vec![store_error(), store_error(), received()]);
-		assert_eq!(run(&mut watch).await.map(|p| p.id), Some(PaymentId([0x33; 32])));
-		assert_eq!(watch.looked, 3);
+	async fn rebalance_wait_never_gives_up_on_a_persistent_store_error() {
+		let mut watch = ScriptedWatch::new(Vec::new());
+		watch.fail_when_unscripted = true;
+		let res = tokio::time::timeout(Duration::from_millis(200), run(&mut watch)).await;
+		assert!(res.is_err(), "the wait ended on a persistent store error");
+		assert!(watch.looked > 10, "only {} lookups", watch.looked);
+		// Every wait after a failed lookup is the bounded one, so a missed receipt is looked
+		// for again even if no wake-up comes.
+		assert!(watch.waits.iter().all(|after_error| *after_error));
 	}
 
-	/// Only errors in a row count: a successful lookup in between resets the count.
+	/// However many lookups fail first, a payment that is then found is the result.
 	#[tokio::test]
-	async fn rebalance_wait_counts_only_consecutive_store_errors() {
-		let mut watch = ScriptedWatch::new(vec![
-			store_error(),
-			store_error(),
-			Ok(InboundReceipt::NotYet),
-			store_error(),
-			store_error(),
-			received(),
-		]);
+	async fn rebalance_wait_succeeds_after_store_errors() {
+		let mut looks: Vec<_> = (0..10).map(|_| store_error()).collect();
+		looks.push(Ok(InboundReceipt::NotYet));
+		looks.push(store_error());
+		looks.push(received());
+		let mut watch = ScriptedWatch::new(looks);
 		assert_eq!(run(&mut watch).await.map(|p| p.id), Some(PaymentId([0x33; 32])));
-		assert_eq!(watch.looked, 6);
-		assert_eq!(watch.waits, vec![true, true, false, true, true]);
+		assert_eq!(watch.looked, 13);
+		let mut expected_waits = vec![true; 10];
+		expected_waits.extend([false, true]);
+		assert_eq!(watch.waits, expected_waits);
 	}
 
 	#[tokio::test]
