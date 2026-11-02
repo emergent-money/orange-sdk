@@ -4,7 +4,7 @@ use crate::bitcoin::hex::DisplayHex;
 use crate::logging::Logger;
 use crate::runtime::Runtime;
 use crate::store::{PaymentId, TxMetadataStore, TxStatus};
-use crate::trusted_wallet::{Payment, TrustedError, TrustedWalletInterface};
+use crate::trusted_wallet::{Payment, SendFailures, TrustedError, TrustedWalletInterface};
 use crate::{Event, EventQueue, InitFailure, Seed, WalletConfig};
 
 use crate::dyn_store::DynStore;
@@ -73,6 +73,8 @@ pub struct Cashu {
 	runtime: Arc<Runtime>,
 	npubcash_url: Option<String>,
 	npub: Option<String>,
+	/// Hashes of payments whose melt the mint reported failed.
+	send_failures: Arc<SendFailures>,
 }
 
 impl TrustedWalletInterface for Cashu {
@@ -401,6 +403,12 @@ impl TrustedWalletInterface for Cashu {
 		})
 	}
 
+	fn await_payment_failure(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move { self.send_failures.recorded(&payment_hash).await })
+	}
+
 	fn get_lightning_address(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
@@ -666,6 +674,7 @@ impl Cashu {
 			runtime,
 			npubcash_url,
 			npub,
+			send_failures: Arc::new(SendFailures::default()),
 		})
 	}
 
@@ -699,6 +708,7 @@ impl Cashu {
 		let event_queue = Arc::clone(&self.event_queue);
 		let tx_metadata = self.tx_metadata.clone();
 		let payment_success_sender = self.payment_success_sender.clone();
+		let send_failures = Arc::clone(&self.send_failures);
 		self.runtime.spawn_background_task(async move {
 			let mut metadata = HashMap::new();
 			if let Some(hash) = &payment_hash {
@@ -800,6 +810,12 @@ impl Cashu {
 						},
 						MeltQuoteState::Failed => {
 							log_error!(logger, "Melt failed for quote: {quote_id}");
+							// The mint says the payment failed: the definite failure
+							// `await_payment_failure` waits for. (An erroring melt call is not:
+							// the mint may still be paying.)
+							if let Some(hash) = &payment_hash {
+								send_failures.record(hash.0);
+							}
 							let payment_id = PaymentId::Trusted(payment_id);
 							let is_rebalance = {
 								let map = tx_metadata.read();
@@ -982,7 +998,10 @@ impl Cashu {
 	pub(crate) async fn await_payment_success(&self) {
 		let mut flag = self.payment_success_flag.clone();
 		flag.mark_unchanged();
-		let _ = flag.changed().await;
+		if flag.changed().await.is_err() {
+			// The sender is gone: wait a little, so callers that loop cannot spin.
+			tokio::time::sleep(Duration::from_secs(1)).await;
+		}
 	}
 }
 
