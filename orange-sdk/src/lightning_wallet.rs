@@ -33,7 +33,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Notify, watch};
 
 #[derive(Debug, Clone, Copy)]
@@ -594,38 +594,22 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
 			let payment_hash = PaymentHash(payment_hash);
-			let mut flag = self.inner.payment_receipt_flag.clone();
-			loop {
-				// Mark the flag seen before looking, not after: a receipt handled while we look
-				// then wakes the wait below instead of being missed.
-				flag.mark_unchanged();
-				match self.inbound_receipt(payment_hash) {
-					Ok(InboundReceipt::Received(payment)) => {
-						let fee_paid_msat = match payment.kind {
-							PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } => {
-								counterparty_skimmed_fee_msat
-							},
-							_ => None,
-						};
-						// The id ldk-node stored the payment under, which `list_transactions` and
-						// the rebalance metadata key on; it is not the payment hash.
-						return Some(ReceivedLightningPayment { id: payment.id.0, fee_paid_msat });
-					},
-					Ok(InboundReceipt::Failed) => return None,
-					Ok(InboundReceipt::NotYet) => {},
-					Err(e) => {
-						log_error!(
-							self.inner.logger,
-							"Failed to look up the payment for hash {payment_hash} while waiting for it: {e}"
-						);
-						return None;
-					},
-				}
-				if flag.changed().await.is_err() {
-					// The event handler is gone, so no receipt will be signalled any more.
-					return None;
-				}
-			}
+			let mut watch = NodeReceiptWatch {
+				wallet: self,
+				flag: self.inner.payment_receipt_flag.clone(),
+				payment_hash,
+			};
+			let payment =
+				await_inbound_receipt(&mut watch, payment_hash, &self.inner.logger).await?;
+			let fee_paid_msat = match payment.kind {
+				PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } => {
+					counterparty_skimmed_fee_msat
+				},
+				_ => None,
+			};
+			// The id ldk-node stored the payment under, which `list_transactions` and the rebalance
+			// metadata key on; it is not the payment hash.
+			Some(ReceivedLightningPayment { id: payment.id.0, fee_paid_msat })
 		})
 	}
 
@@ -754,6 +738,94 @@ impl SplicePendingInbox {
 				return txo;
 			}
 			notified.await;
+		}
+	}
+}
+
+/// How many failed lookups in a row [`await_inbound_receipt`] tolerates before it gives up.
+const MAX_CONSECUTIVE_RECEIPT_ERRORS: u32 = 3;
+
+/// After a failed lookup, how long [`await_inbound_receipt`] waits for a wake-up before looking
+/// again anyway: the receipt the failed lookup missed may have been the last wake-up to come.
+const RECEIPT_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// What [`await_inbound_receipt`] looks at and waits on.
+trait ReceiptWatch {
+	/// Looks up whether the payment has been received. Takes the wake-up state first, so a
+	/// receipt signalled during the lookup wakes the next [`Self::wait`] instead of being missed.
+	fn look(&mut self) -> Result<InboundReceipt, NodeError>;
+
+	/// Waits for the next wake-up; after a failed lookup, for at most [`RECEIPT_RETRY_DELAY`].
+	/// Returns `false` once no wake-up can come any more.
+	fn wait(&mut self, after_error: bool) -> impl Future<Output = bool> + Send;
+}
+
+/// The rebalance wait of [`LightningWallet`]'s `await_payment_receipt`: wakes on every handled
+/// payment receipt (`LdkEventHandler::payment_receipt_sender`).
+struct NodeReceiptWatch<'a> {
+	wallet: &'a LightningWallet,
+	flag: watch::Receiver<()>,
+	payment_hash: PaymentHash,
+}
+
+impl ReceiptWatch for NodeReceiptWatch<'_> {
+	fn look(&mut self) -> Result<InboundReceipt, NodeError> {
+		// Mark the flag seen before looking, not after: a receipt handled while we look then wakes
+		// the wait instead of being missed.
+		self.flag.mark_unchanged();
+		self.wallet.inbound_receipt(self.payment_hash)
+	}
+
+	async fn wait(&mut self, after_error: bool) -> bool {
+		if after_error {
+			match tokio::time::timeout(RECEIPT_RETRY_DELAY, self.flag.changed()).await {
+				Ok(changed) => changed.is_ok(),
+				// No wake-up in time: look again anyway.
+				Err(_elapsed) => true,
+			}
+		} else {
+			self.flag.changed().await.is_ok()
+		}
+	}
+}
+
+/// Waits until `watch` reports the payment for `payment_hash` received (`Some`) or failed (`None`).
+///
+/// A failed lookup (a payment-store read can now fail) is retried on the next wake-up, up to
+/// [`MAX_CONSECUTIVE_RECEIPT_ERRORS`] in a row. Then we give up with `None`, which the rebalancer
+/// takes as a failed rebalance: the money is not affected, but if the payment did arrive the
+/// rebalance is not recorded as one, so its Lightning leg shows as an ordinary receive.
+async fn await_inbound_receipt<W: ReceiptWatch>(
+	watch: &mut W, payment_hash: PaymentHash, logger: &Logger,
+) -> Option<PaymentDetails> {
+	let mut consecutive_errors = 0;
+	loop {
+		let after_error = match watch.look() {
+			Ok(InboundReceipt::Received(payment)) => return Some(payment),
+			Ok(InboundReceipt::Failed) => return None,
+			Ok(InboundReceipt::NotYet) => {
+				consecutive_errors = 0;
+				false
+			},
+			Err(e) => {
+				consecutive_errors += 1;
+				if consecutive_errors >= MAX_CONSECUTIVE_RECEIPT_ERRORS {
+					log_error!(
+						logger,
+						"Giving up waiting for the payment for hash {payment_hash} after {consecutive_errors} failed lookups in a row (last: {e}): if it arrived, the rebalance completed but was not recorded"
+					);
+					return None;
+				}
+				log_error!(
+					logger,
+					"Failed to look up the payment for hash {payment_hash} while waiting for it ({consecutive_errors} in a row), will retry: {e}"
+				);
+				true
+			},
+		};
+		if !watch.wait(after_error).await {
+			// The event handler is gone, so no receipt will be signalled any more.
+			return None;
 		}
 	}
 }
@@ -1013,6 +1085,93 @@ mod tests {
 		// A later claimable payment to the same hash (which is failed back) does not hide it.
 		ids.record_claimable(hash, first);
 		assert_eq!(ids.get(&hash), Some(second));
+	}
+
+	/// A [`ReceiptWatch`] that plays back scripted lookups.
+	struct ScriptedWatch {
+		looks: VecDeque<Result<InboundReceipt, NodeError>>,
+		looked: usize,
+		waits: Vec<bool>,
+		/// Whether wake-ups can still come.
+		alive: bool,
+	}
+
+	impl ScriptedWatch {
+		fn new(looks: Vec<Result<InboundReceipt, NodeError>>) -> Self {
+			Self { looks: looks.into(), looked: 0, waits: Vec::new(), alive: true }
+		}
+	}
+
+	impl ReceiptWatch for ScriptedWatch {
+		fn look(&mut self) -> Result<InboundReceipt, NodeError> {
+			self.looked += 1;
+			self.looks.pop_front().expect("looked more often than scripted")
+		}
+
+		async fn wait(&mut self, after_error: bool) -> bool {
+			self.waits.push(after_error);
+			self.alive
+		}
+	}
+
+	fn received() -> Result<InboundReceipt, NodeError> {
+		Ok(InboundReceipt::Received(payment(
+			[0x33; 32],
+			bolt11(HASH, None),
+			PaymentDirection::Inbound,
+			PaymentStatus::Succeeded,
+		)))
+	}
+
+	fn store_error() -> Result<InboundReceipt, NodeError> {
+		Err(NodeError::PersistenceFailed)
+	}
+
+	async fn run(watch: &mut ScriptedWatch) -> Option<PaymentDetails> {
+		let logger = Logger::new(&crate::logging::LoggerType::LogFacade).expect("logger");
+		await_inbound_receipt(watch, PaymentHash(HASH), &logger).await
+	}
+
+	/// The wait survives store errors, but gives up after three failed lookups in a row.
+	#[tokio::test]
+	async fn rebalance_wait_gives_up_after_three_consecutive_store_errors() {
+		let mut watch = ScriptedWatch::new(vec![store_error(), store_error(), store_error()]);
+		assert_eq!(run(&mut watch).await, None);
+		assert_eq!(watch.looked, 3);
+		// Each failed lookup but the last was followed by a bounded wait.
+		assert_eq!(watch.waits, vec![true, true]);
+
+		let mut watch = ScriptedWatch::new(vec![store_error(), store_error(), received()]);
+		assert_eq!(run(&mut watch).await.map(|p| p.id), Some(PaymentId([0x33; 32])));
+		assert_eq!(watch.looked, 3);
+	}
+
+	/// Only errors in a row count: a successful lookup in between resets the count.
+	#[tokio::test]
+	async fn rebalance_wait_counts_only_consecutive_store_errors() {
+		let mut watch = ScriptedWatch::new(vec![
+			store_error(),
+			store_error(),
+			Ok(InboundReceipt::NotYet),
+			store_error(),
+			store_error(),
+			received(),
+		]);
+		assert_eq!(run(&mut watch).await.map(|p| p.id), Some(PaymentId([0x33; 32])));
+		assert_eq!(watch.looked, 6);
+		assert_eq!(watch.waits, vec![true, true, false, true, true]);
+	}
+
+	#[tokio::test]
+	async fn rebalance_wait_ends_on_a_failed_payment_or_without_wake_ups() {
+		let mut watch = ScriptedWatch::new(vec![Ok(InboundReceipt::Failed)]);
+		assert_eq!(run(&mut watch).await, None);
+		assert!(watch.waits.is_empty());
+
+		let mut watch = ScriptedWatch::new(vec![Ok(InboundReceipt::NotYet)]);
+		watch.alive = false;
+		assert_eq!(run(&mut watch).await, None);
+		assert_eq!(watch.looked, 1);
 	}
 
 	/// ldk-node's payment namespace (`PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE`, crate-private
