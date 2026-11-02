@@ -61,6 +61,12 @@ pub(crate) struct LightningWallet {
 
 const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
+/// The expiry of the invoices the rebalancer has our trusted wallet pay. It pays them at once
+/// and a JIT channel open takes well under a minute, so an hour is ample. It also bounds how long
+/// the rebalancer can wait for a payment that failed without our learning of it, see
+/// [`graduated_rebalancer::RECEIPT_DEADLINE_GRACE`].
+const REBALANCE_INVOICE_EXPIRY_SECS: u32 = 3_600;
+
 impl LightningWallet {
 	pub(super) async fn init(
 		runtime: Arc<Runtime>, config: WalletConfig, store: Arc<dyn DynStore>,
@@ -279,33 +285,32 @@ impl LightningWallet {
 	pub(crate) async fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
 	) -> Result<Bolt11Invoice, NodeError> {
+		self.get_bolt11_invoice_expiring(amount, DEFAULT_INVOICE_EXPIRY_SECS).await
+	}
+
+	async fn get_bolt11_invoice_expiring(
+		&self, amount: Option<Amount>, expiry_secs: u32,
+	) -> Result<Bolt11Invoice, NodeError> {
 		let desc = Bolt11InvoiceDescription::Direct(Description::empty());
 		if let Some(amt) = amount {
 			if self.estimate_receivable_balance() >= amt {
-				self.inner.ldk_node.bolt11_payment().receive(
-					amt.milli_sats(),
-					&desc,
-					DEFAULT_INVOICE_EXPIRY_SECS,
-				)
+				self.inner.ldk_node.bolt11_payment().receive(amt.milli_sats(), &desc, expiry_secs)
 			} else {
 				self.inner.ldk_node.bolt11_payment().receive_via_jit_channel(
 					amt.milli_sats(),
 					&desc,
-					DEFAULT_INVOICE_EXPIRY_SECS,
+					expiry_secs,
 					None,
 				)
 			}
 		} else if self.estimate_receivable_balance() // if we can receive at least 100k sats, don't use JIT
 			>= Amount::from_sats(100_000).expect("valid amount")
 		{
-			self.inner
-				.ldk_node
-				.bolt11_payment()
-				.receive_variable_amount(&desc, DEFAULT_INVOICE_EXPIRY_SECS)
+			self.inner.ldk_node.bolt11_payment().receive_variable_amount(&desc, expiry_secs)
 		} else {
 			self.inner.ldk_node.bolt11_payment().receive_variable_amount_via_jit_channel(
 				&desc,
-				DEFAULT_INVOICE_EXPIRY_SECS,
+				expiry_secs,
 				None,
 			)
 		}
@@ -600,7 +605,10 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 	fn get_bolt11_invoice(
 		&self, amount: Option<Amount>,
 	) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, Self::Error>> + Send + '_>> {
-		Box::pin(async move { self.get_bolt11_invoice(amount).await })
+		// Only the rebalancer asks for invoices through this trait.
+		Box::pin(async move {
+			self.get_bolt11_invoice_expiring(amount, REBALANCE_INVOICE_EXPIRY_SECS).await
+		})
 	}
 
 	fn pay(

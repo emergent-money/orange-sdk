@@ -21,8 +21,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// How long after the expiry of a rebalance invoice the rebalancer still waits for the payment to
-/// it to be received, covering a payment that was in flight when the invoice expired.
-pub const RECEIPT_DEADLINE_GRACE: Duration = Duration::from_secs(60);
+/// it to be received.
+///
+/// LDK accepts a payment to one of its invoices until two hours after the invoice's expiry, as a
+/// buffer against block timestamps running ahead of real time (rust-lightning
+/// `inbound_payment.rs:271-280`, `calculate_absolute_expiry`), so the wait covers that window:
+/// no payment it could still accept arrives after the wait has ended.
+pub const RECEIPT_DEADLINE_GRACE: Duration = Duration::from_secs(7_200);
+
+/// When the rebalancer stops waiting for the payment to `invoice` to be received: the invoice's
+/// expiry plus [`RECEIPT_DEADLINE_GRACE`], as a time since the Unix epoch. Without an expiry that
+/// fits a `Duration`, it waits as long as it takes.
+fn receipt_deadline(invoice: &Bolt11Invoice) -> Duration {
+	invoice
+		.expires_at()
+		.map_or(Duration::MAX, |expiry| expiry.saturating_add(RECEIPT_DEADLINE_GRACE))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Parameters for doing a rebalance
@@ -337,10 +351,7 @@ where
 				"Attempting to pay invoice {inv} to rebalance for {transfer_amt:?}",
 			);
 			let expected_hash = inv.payment_hash();
-			// Without an expiry that fits a `Duration`, wait as long as it takes.
-			let receipt_deadline = inv
-				.expires_at()
-				.map_or(Duration::MAX, |expiry| expiry.saturating_add(RECEIPT_DEADLINE_GRACE));
+			let receipt_deadline = receipt_deadline(&inv);
 			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
 				Ok(rebalance_id) => {
 					log_debug!(
@@ -469,5 +480,37 @@ where
 	pub async fn stop(&self) {
 		log_debug!(self.logger, "Waiting for balance mutex...");
 		let _ = self.balance_mutex.lock().await;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use lightning::bitcoin::hashes::{sha256, Hash};
+	use lightning::bitcoin::secp256k1::{Secp256k1, SecretKey};
+	use lightning::types::payment::{PaymentHash, PaymentSecret};
+	use lightning_invoice::{Currency, InvoiceBuilder};
+
+	pub(crate) fn invoice(expiry: Duration) -> Bolt11Invoice {
+		let secp = Secp256k1::new();
+		let key = SecretKey::from_slice(&[42; 32]).unwrap();
+		InvoiceBuilder::new(Currency::Regtest)
+			.description(String::new())
+			.amount_milli_satoshis(1_000_000)
+			.payment_hash(PaymentHash(sha256::Hash::hash(&[1; 32]).to_byte_array()))
+			.payment_secret(PaymentSecret([0; 32]))
+			.duration_since_epoch(Duration::from_secs(1_700_000_000))
+			.expiry_time(expiry)
+			.min_final_cltv_expiry_delta(144)
+			.build_signed(|msg| secp.sign_ecdsa_recoverable(msg, &key))
+			.unwrap()
+	}
+
+	/// The wait for a rebalance payment ends two hours after its invoice expires, when LDK stops
+	/// accepting payments to it.
+	#[test]
+	fn receipt_deadline_is_the_invoice_expiry_plus_ldks_acceptance_window() {
+		let one_hour = invoice(Duration::from_secs(3_600));
+		assert_eq!(receipt_deadline(&one_hour), Duration::from_secs(1_700_000_000 + 3_600 + 7_200));
 	}
 }
