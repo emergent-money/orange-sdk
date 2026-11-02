@@ -345,14 +345,12 @@ impl LightningWallet {
 	/// failing that (the event has not been handled yet, or was handled before a restart) we
 	/// search the payment store, newest first, stopping at the first received payment.
 	fn inbound_receipt(&self, payment_hash: PaymentHash) -> Result<InboundReceipt, NodeError> {
-		if let Some(id) = self.inner.inbound_payment_ids.get(&payment_hash) {
-			if let Some(payment) = self.inner.ldk_node.payment(&id)? {
-				if is_inbound_bolt11_for(&payment, payment_hash)
-					&& payment.status == PaymentStatus::Succeeded
-				{
-					return Ok(InboundReceipt::Received(payment));
-				}
-			}
+		if let Some(id) = self.inner.inbound_payment_ids.get(&payment_hash)
+			&& let Some(payment) = self.inner.ldk_node.payment(&id)?
+			&& is_inbound_bolt11_for(&payment, payment_hash)
+			&& payment.status == PaymentStatus::Succeeded
+		{
+			return Ok(InboundReceipt::Received(payment));
 		}
 
 		let mut search = InboundReceiptSearch::default();
@@ -1419,7 +1417,8 @@ mod tests {
 	/// every scan. At 0cea341 every payment was held in memory and a scan read none.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn full_payment_listing_reads_every_payment_beyond_the_warm_cache() {
-		for n in [50, 500] {
+		// 60 is the case above the warm set that makes the read count meaningful.
+		for n in [50, 60, 500] {
 			let dir = TempDir(std::env::temp_dir().join(format!(
 				"orange-sdk-list-cost-test-{n}-{}",
 				SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()

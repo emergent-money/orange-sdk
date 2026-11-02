@@ -617,10 +617,10 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			let mut flag = self.payment_success_flag.clone();
 			loop {
 				flag.mark_unchanged();
-				if let Ok(Some(payment)) = self.ldk_node.payment(&id) {
-					if payment.status == PaymentStatus::Failed {
-						return;
-					}
+				if let Ok(Some(payment)) = self.ldk_node.payment(&id)
+					&& payment.status == PaymentStatus::Failed
+				{
+					return;
 				}
 				// The flag is signalled on every payment success and failure; poll as well, as a
 				// send that fails at once is recorded without an event.

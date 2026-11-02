@@ -666,13 +666,11 @@ mod tests {
 
 	struct AlwaysTrusted;
 	impl RebalanceTrigger for AlwaysTrusted {
-		fn needs_trusted_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
-			async {
-				Some(TriggerParams { id: [3; 32], amount: Amount::from_sats(150_000).unwrap() })
-			}
+		async fn needs_trusted_rebalance(&self) -> Option<TriggerParams> {
+			Some(TriggerParams { id: [3; 32], amount: Amount::from_sats(150_000).unwrap() })
 		}
-		fn needs_onchain_rebalance(&self) -> impl Future<Output = Option<TriggerParams>> + Send {
-			async { None }
+		async fn needs_onchain_rebalance(&self) -> Option<TriggerParams> {
+			None
 		}
 	}
 
