@@ -445,12 +445,12 @@ where
 							let grace = Duration::from_millis(
 								self.trusted_failure_receipt_grace_ms.load(Ordering::Relaxed),
 							);
-														log_warn!(
+							log_warn!(
 								self.logger,
 								"Rebalance payment failed on the trusted side; waiting up to {grace:?} for a Lightning receipt in case it was received anyway"
 							);
 							let grace_end = tokio::time::Instant::now() + grace;
-														verdict_deadline = Some(grace_end.min(deadline));
+							verdict_deadline = Some(grace_end.min(deadline));
 							match tokio::time::timeout_at(grace_end, &mut receipt).await {
 								Ok(Some(receipt)) => {
 									log_warn!(
@@ -509,7 +509,7 @@ where
 						Err(_) => {
 							log_warn!(
 								self.logger,
-																"Rebalance payment was received by our node, but the trusted side reported no outcome in time; recording the rebalance with the trusted fee unknown"
+								"Rebalance payment was received by our node, but the trusted side reported no outcome in time; recording the rebalance with the trusted fee unknown"
 							);
 							None
 						},
