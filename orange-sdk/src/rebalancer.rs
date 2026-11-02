@@ -317,7 +317,7 @@ impl OrangeRebalanceEventHandler {
 #[derive(Default)]
 pub(crate) struct TestPause {
 	armed: std::sync::atomic::AtomicBool,
-	first_written: tokio::sync::Notify,
+	paused: tokio::sync::Notify,
 	resume: tokio::sync::Notify,
 }
 
@@ -329,7 +329,7 @@ impl TestPause {
 
 	/// Resolves once an armed pause has been reached.
 	pub(crate) async fn reached(&self) {
-		self.first_written.notified().await;
+		self.paused.notified().await;
 	}
 
 	pub(crate) fn resume(&self) {
@@ -338,7 +338,7 @@ impl TestPause {
 
 	pub(crate) async fn pause_if_armed(&self) {
 		if self.armed.swap(false, Ordering::SeqCst) {
-			self.first_written.notify_one();
+			self.paused.notify_one();
 			self.resume.notified().await;
 		}
 	}
@@ -390,14 +390,14 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 						},
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
-					// The trigger is promoted before the transfer records are written, so a
-					// `list_transactions` that reads the metadata at any point, or a restart after a
-					// crash between the writes, places the transfer from its promoted trigger and
-					// shows the fees of whichever legs it has listed. One write lock over the
-					// in-memory updates is defence in depth; persistence is not atomic (see
-					// `set_tx_caused_rebalance_with_transfer`). `lightning_id` is the id ldk-node
-					// stored the received payment under (derived from its HTLCs, not the payment
-					// hash), as `list_transactions` looks it up.
+					// The trigger is promoted before the transfer records are written, and
+					// `list_transactions` places a transfer from its promoted trigger and shows the
+					// fees of whichever legs it has listed. One write lock over the in-memory
+					// updates is defence in depth; persistence is not atomic (see
+					// `set_tx_caused_rebalance_with_transfer` for what a crash between the writes
+					// leaves). `lightning_id` is the id ldk-node stored the received payment under
+					// (derived from its HTLCs, not the payment hash), as `list_transactions` looks
+					// it up.
 					self.tx_metadata
 						.set_tx_caused_rebalance_with_transfer(
 							&triggering_transaction_id,

@@ -570,16 +570,19 @@ impl TxMetadataStore {
 	///
 	/// What keeps readers correct is the order and the listing's rule, not the lock: the trigger is
 	/// promoted first, in memory and on disk, and `list_transactions` places a transfer from its
-	/// promoted trigger and shows the fees of whichever legs it has listed. Every prefix of these
-	/// writes (trigger; trigger and Lightning; all three) is therefore a state the listing shows
-	/// correctly, and it is also what a crash between the persisted writes leaves. A transfer leg's
-	/// record without its promoted trigger is the one state that would mislist (the trigger as a
-	/// plain payment, the leg dropped), and promotion first rules it out.
-	///
+	/// promoted trigger and shows the fees of whichever legs it has listed. A transfer leg's record
+	/// without its promoted trigger is the state that would mislist (the trigger as a plain
+	/// payment, the leg's transfer dropped, and a debug assert), and promotion first rules it out.
 	/// The single write lock over the in-memory updates, as in
 	/// [`Self::set_tx_caused_rebalance_with_splice`], is defence in depth: a concurrent reader sees
-	/// all three records or none. Persistence is not atomic: the three keys are written one at a
-	/// time, in that order (trigger, Lightning, trusted).
+	/// all three records or none.
+	///
+	/// Persistence is not atomic: the three keys are written one at a time, in that order (trigger,
+	/// Lightning, trusted). A crash after the Lightning record leaves a transfer that shows the
+	/// receive fee alone (the trusted send stays a hidden pending rebalance). A crash after the
+	/// trigger alone leaves the Lightning receipt without metadata, so it lists as a receive of
+	/// its own beside the transfer, as it does in memory between the receipt and these writes;
+	/// the previous order (trigger, trusted, Lightning) had the same first write.
 	pub(crate) async fn set_tx_caused_rebalance_with_transfer(
 		&self, trigger_id: &PaymentId, lightning_id: PaymentId, trusted_id: PaymentId,
 		transfer_metadata: TxMetadata,

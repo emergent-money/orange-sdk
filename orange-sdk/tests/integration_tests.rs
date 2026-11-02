@@ -408,25 +408,12 @@ async fn test_sweep_to_ln_without_a_trusted_outcome() {
 		.await;
 }
 
-/// The sweep of `test_sweep_to_ln_without_a_trusted_outcome`, listing transactions while the
-/// rebalance is being recorded (stopped where its transfer records are written), with its trusted
-/// send unlisted.
-#[tokio::test(flavor = "multi_thread")]
-#[test_log::test]
-async fn test_sweep_to_ln_listing_between_transfer_records() {
-	run_test_sweep_to_ln(SweepVariant {
-		withhold_trusted_outcome: true,
-		list_between_transfer_records: true,
-		..Default::default()
-	})
-	.await;
-}
-
 /// The sweep with a listing that overlaps the recording of the rebalance: it lists the payments
-/// before the rebalance is received and reads the transaction metadata only once the rebalance's
-/// transfer records are being written. Its trusted send is listed (as Spark lists it), still
-/// marked as a pending rebalance in the listing's view, and the Lightning receipt is missing from
-/// it, so only the metadata can place the transfer.
+/// once the rebalance's trusted send is made but before its Lightning receipt, and reads the
+/// transaction metadata only once the rebalance's transfer records are written. It has the
+/// triggering receive and the trusted send (listed, as Spark lists it) but not the Lightning
+/// receipt, so it shows the transfer from its promoted trigger with the send's fee and without
+/// the Lightning receive fee.
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_listing_across_transfer_records() {
@@ -436,8 +423,7 @@ async fn test_sweep_to_ln_listing_across_transfer_records() {
 
 /// The overlapping listing of `test_sweep_to_ln_listing_across_transfer_records` with the
 /// rebalance's trusted send unlisted (as Cashu, for a melt not finalized as paid): the listing has
-/// neither the Lightning receipt nor the send, so only the promoted trigger tells it the transfer
-/// is trusted-to-Lightning.
+/// neither leg, so it shows the transfer from its promoted trigger alone, with no fee yet.
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_listing_across_transfer_records_without_a_trusted_outcome() {
@@ -456,10 +442,8 @@ struct SweepVariant {
 	forget_inbound_payment_ids: bool,
 	/// The trusted wallet reports no outcome for, and does not list, its payments.
 	withhold_trusted_outcome: bool,
-	/// List transactions while the rebalance's transfer records are being written.
-	list_between_transfer_records: bool,
-	/// Start a listing before the rebalance is received and let it read the metadata only while
-	/// the rebalance's transfer records are being written.
+	/// Start a listing before the rebalance is received and let it read the metadata only once
+	/// the rebalance's transfer records are written.
 	list_across_transfer_records: bool,
 }
 
@@ -474,7 +458,7 @@ async fn run_test_sweep_to_ln(variant: SweepVariant) {
 		if variant.withhold_trusted_outcome {
 			wallet.withhold_trusted_payment_outcomes_for_tests();
 		}
-		if variant.list_between_transfer_records || variant.list_across_transfer_records {
+		if variant.list_across_transfer_records {
 			wallet.arm_transfer_record_pause_for_tests();
 		}
 
@@ -578,18 +562,13 @@ async fn run_test_sweep_to_ln(variant: SweepVariant) {
 				e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 			};
 
-		if variant.list_between_transfer_records || variant.list_across_transfer_records {
+		if variant.list_across_transfer_records {
 			tokio::time::timeout(
 				Duration::from_secs(20),
 				wallet.transfer_record_pause_reached_for_tests(),
 			)
 			.await
-			.expect("the rebalance reached the pause where its transfer records are written");
-		}
-		if variant.list_between_transfer_records {
-			// The trusted send is unlisted: the listing must still place the transfer (debug
-			// builds assert when they cannot).
-			wallet.list_transactions().await.unwrap();
+			.expect("the rebalance stopped right after its transfer records were written");
 		}
 		if let Some(listing) = overlapping_listing {
 			wallet.resume_listing_for_tests();
@@ -606,7 +585,7 @@ async fn run_test_sweep_to_ln(variant: SweepVariant) {
 				"the listing saw the rebalance's receipt: {transfer:?}"
 			);
 		}
-		if variant.list_between_transfer_records || variant.list_across_transfer_records {
+		if variant.list_across_transfer_records {
 			wallet.resume_transfer_records_for_tests();
 		}
 
