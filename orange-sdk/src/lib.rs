@@ -1167,8 +1167,9 @@ impl Wallet {
 			// listing can lack a trusted-to-Lightning transfer's send: the rebalancer records a
 			// transfer once our node has received the payment, without waiting for the trusted
 			// side's verdict, and Cashu lists a melt only once it finalized as paid (never, after a
-			// failed melt or while one is pending). A crash between the persisted records leaves
-			// the same state. The transfer then shows the receive fee alone, or no fee yet.
+			// failed melt or while one is pending). A crash between the persisted records can leave
+			// the same state (see `TxMetadataStore::set_tx_caused_rebalance_with_transfer`). The
+			// transfer then shows the receive fee alone, or no fee yet.
 			//
 			// The trigger itself predates its transfer, so a listing that has either leg has it too
 			// (ldk-node pages by creation order, which never skips a payment that existed throughout
