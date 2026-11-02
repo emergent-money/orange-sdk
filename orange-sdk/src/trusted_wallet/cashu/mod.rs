@@ -715,11 +715,10 @@ impl Cashu {
 				metadata.insert(PAYMENT_HASH_METADATA_KEY.to_string(), hash.to_string());
 			}
 
-			let melt_result = async {
-				let prepared = cashu_wallet.prepare_melt(&quote_id, metadata).await?;
-				prepared.confirm().await
-			}
-			.await;
+			let melt_result = match cashu_wallet.prepare_melt(&quote_id, metadata).await {
+				Ok(prepared) => prepared.confirm().await.map_err(|e| (MeltStage::Confirm, e)),
+				Err(e) => Err((MeltStage::Prepare, e)),
+			};
 			match melt_result {
 				Ok(res) => {
 					match res.state() {
@@ -809,10 +808,9 @@ impl Cashu {
 							payment_success_sender.send(()).unwrap();
 						},
 						MeltQuoteState::Failed => {
+							// cdk 0.16 reports a failed melt as `Err(PaymentFailed)` (below), not
+							// as this state; should it ever come back here, it is as definite.
 							log_error!(logger, "Melt failed for quote: {quote_id}");
-							// The mint says the payment failed: the definite failure
-							// `await_payment_failure` waits for. (An erroring melt call is not:
-							// the mint may still be paying.)
 							if let Some(hash) = &payment_hash {
 								send_failures.record(hash.0);
 							}
@@ -841,8 +839,13 @@ impl Cashu {
 						},
 					}
 				},
-				Err(e) => {
+				Err((stage, e)) => {
 					log_error!(logger, "Failed to melt quote {quote_id}: {e}");
+					if melt_failed_for_good(stage, &e)
+						&& let Some(hash) = &payment_hash
+					{
+						send_failures.record(hash.0);
+					}
 					let payment_id = PaymentId::Trusted(payment_id);
 					let is_rebalance = {
 						let map = tx_metadata.read();
@@ -1005,6 +1008,27 @@ impl Cashu {
 	}
 }
 
+/// Where a melt went wrong.
+#[derive(Clone, Copy, Debug)]
+enum MeltStage {
+	Prepare,
+	Confirm,
+}
+
+/// Whether a melt that ended in `error` at `stage` failed for good, so its payment cannot
+/// complete: the definite failure [`TrustedWalletInterface::await_payment_failure`] waits for.
+fn melt_failed_for_good(stage: MeltStage, error: &cdk::Error) -> bool {
+	match stage {
+		// `prepare_melt` only selects and reserves proofs: nothing has been sent to the mint.
+		MeltStage::Prepare => true,
+		// `confirm` returns `PaymentFailed` only once the mint reported the quote failed, unpaid
+		// or unknown and cdk released the proofs (cdk 0.16 `wallet/melt/saga/mod.rs:905-914`,
+		// `:1007-1009`, `wallet/melt/mod.rs:194-198`). Any other error can leave the mint paying,
+		// and `RequestAlreadyPaid` means the invoice is paid.
+		MeltStage::Confirm => matches!(error, cdk::Error::PaymentFailed),
+	}
+}
+
 fn convert_amount(cdk_amount: CdkAmount, unit: &CurrencyUnit) -> Result<Amount, TrustedError> {
 	match unit {
 		CurrencyUnit::Sat => {
@@ -1032,8 +1056,7 @@ mod tests {
 
 	// Initializing a Cashu wallet does not wait on the mint (only background tasks contact it), so
 	// an unreachable mint URL is enough to build one.
-	#[tokio::test(flavor = "multi_thread")]
-	async fn caller_preimage_invoices_are_unsupported() {
+	async fn offline_cashu() -> Cashu {
 		let path = std::env::temp_dir().join(format!(
 			"orange-sdk-cashu-preimage-test-{}",
 			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
@@ -1068,15 +1091,49 @@ mod tests {
 			tunables: Tunables::default(),
 			extra_config: ExtraConfig::Cashu(cashu_config.clone()),
 		};
-		let cashu =
-			Cashu::init(&config, cashu_config, store, event_queue, tx_metadata, logger, runtime)
-				.await
-				.expect("Cashu wallet should initialize without reaching the mint");
+		Cashu::init(&config, cashu_config, store, event_queue, tx_metadata, logger, runtime)
+			.await
+			.expect("Cashu wallet should initialize without reaching the mint")
+	}
 
+	#[tokio::test(flavor = "multi_thread")]
+	async fn caller_preimage_invoices_are_unsupported() {
+		let cashu = offline_cashu().await;
 		let res = cashu
 			.get_bolt11_invoice_with_preimage(Amount::from_sats(1_000).unwrap(), [0x11; 32])
 			.await;
 		assert!(matches!(res, Err(TrustedError::UnsupportedOperation(_))));
 		assert!(!cashu.has_lightning_receive_for_hash([0x22; 32]).await.unwrap());
+	}
+
+	/// Which melt errors count as a definite failure for the rebalancer.
+	#[test]
+	fn definite_melt_failures() {
+		// Nothing was sent if preparing the melt failed, whatever the error.
+		assert!(melt_failed_for_good(MeltStage::Prepare, &cdk::Error::PaymentFailed));
+		assert!(melt_failed_for_good(MeltStage::Prepare, &cdk::Error::UnknownPaymentState));
+		// cdk's verdict after the mint reported the quote failed and the proofs were released.
+		assert!(melt_failed_for_good(MeltStage::Confirm, &cdk::Error::PaymentFailed));
+		// The mint may still be paying, or already paid.
+		assert!(!melt_failed_for_good(MeltStage::Confirm, &cdk::Error::PaymentPending));
+		assert!(!melt_failed_for_good(MeltStage::Confirm, &cdk::Error::UnknownPaymentState));
+		assert!(!melt_failed_for_good(MeltStage::Confirm, &cdk::Error::RequestAlreadyPaid));
+	}
+
+	/// A melt whose preparation fails (here: a quote the wallet does not know, which fails without
+	/// contacting the mint) resolves `await_payment_failure` for its payment hash, through
+	/// `spawn_melt`'s own error handling.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_melt_that_fails_to_prepare_signals_a_definite_failure() {
+		let cashu = offline_cashu().await;
+		let (failed, other) = (PaymentHash([0x5a; 32]), [0x6b; 32]);
+		cashu.spawn_melt("no-such-quote".to_owned(), [0x01; 32], Some(failed));
+		tokio::time::timeout(Duration::from_secs(10), cashu.await_payment_failure(failed.0))
+			.await
+			.expect("the failed melt was signalled");
+		// Only for that payment.
+		let not_failed =
+			tokio::time::timeout(Duration::from_millis(200), cashu.await_payment_failure(other));
+		assert!(not_failed.await.is_err());
 	}
 }
