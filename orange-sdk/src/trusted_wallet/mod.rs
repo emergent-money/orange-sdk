@@ -43,6 +43,42 @@ pub struct Payment {
 
 pub(crate) type DynTrustedWalletInterface = dyn TrustedWalletInterface + Send + Sync;
 
+/// Payment hashes of outgoing payments a trusted wallet saw go wrong, recorded where the wallet
+/// learns of it (a failed melt, an erroring send call) for
+/// [`TrustedWalletInterface::await_payment_failure`] to wait on.
+#[cfg(any(feature = "spark", feature = "cashu"))]
+#[derive(Default)]
+pub(crate) struct SendFailures {
+	hashes: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+	notify: tokio::sync::Notify,
+}
+
+#[cfg(any(feature = "spark", feature = "cashu"))]
+impl SendFailures {
+	pub(crate) fn record(&self, payment_hash: [u8; 32]) {
+		self.hashes.lock().unwrap().insert(payment_hash);
+		self.notify.notify_waiters();
+	}
+
+	pub(crate) fn contains(&self, payment_hash: &[u8; 32]) -> bool {
+		self.hashes.lock().unwrap().contains(payment_hash)
+	}
+
+	/// Resolves once `payment_hash` is recorded, at once if it already is.
+	pub(crate) async fn recorded(&self, payment_hash: &[u8; 32]) {
+		loop {
+			// Register before checking, so a `record` racing with the check still wakes us.
+			let notified = self.notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			if self.contains(payment_hash) {
+				return;
+			}
+			notified.await;
+		}
+	}
+}
+
 /// Represents a trait for a trusted wallet interface.
 pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	/// Returns the current balance of the wallet.
@@ -285,5 +321,35 @@ impl core::fmt::Display for TrustedError {
 impl From<ldk_node::lightning::io::Error> for TrustedError {
 	fn from(e: ldk_node::lightning::io::Error) -> Self {
 		TrustedError::IOError(e)
+	}
+}
+
+#[cfg(all(test, any(feature = "spark", feature = "cashu")))]
+mod tests {
+	use super::*;
+	use std::time::Duration;
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn send_failures_wake_only_waiters_for_the_recorded_hash() {
+		let failures = Arc::new(SendFailures::default());
+		let (a, b) = ([0xaa; 32], [0xbb; 32]);
+
+		let waiter = {
+			let failures = Arc::clone(&failures);
+			tokio::spawn(async move { failures.recorded(&a).await })
+		};
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		assert!(!waiter.is_finished());
+
+		failures.record(b);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		assert!(!waiter.is_finished(), "woke for another hash");
+
+		failures.record(a);
+		tokio::time::timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap();
+
+		// Already recorded: resolves at once.
+		tokio::time::timeout(Duration::from_secs(5), failures.recorded(&b)).await.unwrap();
+		assert!(failures.contains(&a) && failures.contains(&b) && !failures.contains(&[0; 32]));
 	}
 }
