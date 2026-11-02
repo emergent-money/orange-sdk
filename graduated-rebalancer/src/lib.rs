@@ -92,6 +92,19 @@ pub trait TrustedWallet: Send + Sync {
 	fn await_payment_success(
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
+
+	/// Resolves once the payment to `payment_hash` is known to have failed, and never if it is
+	/// not.
+	///
+	/// The rebalancer races this against the Lightning wallet's receipt of the payment, which
+	/// never comes for a payment that failed before reaching it, so it must resolve only on a
+	/// definite failure: never on an unknown status or a failed lookup. The default never
+	/// resolves, leaving the receipt's deadline to end the wait.
+	fn await_payment_failure(
+		&self, _payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(std::future::pending())
+	}
 }
 
 /// Trait representing a lightning wallet backend
@@ -344,14 +357,27 @@ where
 						})
 						.await;
 
-					let ln_payment = match self
-						.ln_wallet
-						.await_payment_receipt(expected_hash.0, receipt_deadline)
-						.await
-					{
-						Some(receipt) => receipt,
-						None => {
-							log_error!(self.logger, "Failed to receive rebalance payment!");
+					// Wait for the Lightning receipt, but stop as soon as the trusted wallet
+					// reports the payment failed: then no receipt is coming, and waiting until
+					// the receipt's deadline would hold `balance_mutex`, blocking every other
+					// rebalance, for as long as the invoice is valid.
+					let receipt =
+						self.ln_wallet.await_payment_receipt(expected_hash.0, receipt_deadline);
+					let trusted_failure = self.trusted.await_payment_failure(expected_hash.0);
+					let ln_payment = tokio::select! {
+						biased;
+						receipt = receipt => match receipt {
+							Some(receipt) => receipt,
+							None => {
+								log_error!(self.logger, "Failed to receive rebalance payment!");
+								return;
+							},
+						},
+						() = trusted_failure => {
+							log_error!(
+								self.logger,
+								"Rebalance payment failed on the trusted side; no Lightning receipt expected"
+							);
 							return;
 						},
 					};

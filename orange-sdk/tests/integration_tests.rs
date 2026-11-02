@@ -2933,3 +2933,72 @@ async fn test_wrapped_receive_lightning_leg() {
 	})
 	.await;
 }
+
+/// A rebalance whose trusted payment fails never reaches our node, so no record of it exists there
+/// and its Lightning receipt never comes. The rebalancer must stop waiting as soon as the trusted
+/// wallet reports the failure, releasing `balance_mutex` within seconds (not at the invoice's
+/// expiry) so the next rebalance can run.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_failed_trusted_rebalance_payment_releases_the_rebalancer() {
+	test_utils::run_test(|params| async move {
+		let wallet = Arc::clone(&params.wallet);
+		let third_party = Arc::clone(&params.third_party);
+
+		// Half the trusted limit: no rebalance yet.
+		let limit = wallet.get_tunables().trusted_balance_limit;
+		let recv_amt = Amount::from_milli_sats(limit.milli_sats() / 2).unwrap();
+		let uri = wallet.get_single_use_receive_uri(Some(recv_amt)).await.unwrap();
+		assert!(uri.from_trusted);
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		match wait_next_event(&wallet).await {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
+
+		// The rebalance this triggers pays with a trusted payment that fails on its way.
+		wallet.fail_next_trusted_payments_for_tests(1);
+		let uri = wallet.get_single_use_receive_uri(Some(limit)).await.unwrap();
+		third_party.bolt11_payment().send(&uri.invoice, None).unwrap();
+		match wait_next_event(&wallet).await {
+			Event::PaymentReceived { .. } => {},
+			e => panic!("Expected PaymentReceived event, got {e:?}"),
+		}
+
+		let failed_rebalance = match wait_next_event(&wallet).await {
+			Event::RebalanceInitiated { trusted_rebalance_payment_id, .. } => {
+				trusted_rebalance_payment_id
+			},
+			e => panic!("Expected RebalanceInitiated event, got {e:?}"),
+		};
+		let failed_at = std::time::Instant::now();
+
+		// Handling that event asks for another rebalance, which can only start once the failed
+		// one has let go of the rebalancer. It pays normally and completes.
+		let mut retried_at = None;
+		let mut retried_rebalance = None;
+		loop {
+			match wait_next_event(&wallet).await {
+				Event::RebalanceInitiated { trusted_rebalance_payment_id, .. } => {
+					assert_ne!(trusted_rebalance_payment_id, failed_rebalance);
+					assert!(retried_rebalance.is_none(), "a third rebalance started");
+					retried_at = Some(failed_at.elapsed());
+					retried_rebalance = Some(trusted_rebalance_payment_id);
+				},
+				Event::RebalanceSuccessful { trusted_rebalance_payment_id, .. } => {
+					assert_eq!(Some(trusted_rebalance_payment_id), retried_rebalance);
+					break;
+				},
+				Event::ChannelOpened { .. } | Event::PaymentReceived { .. } => {},
+				e => panic!("Unexpected event {e:?}"),
+			}
+		}
+		let retried_at = retried_at.expect("the retry started");
+		info!("the next rebalance started {retried_at:?} after the failed one");
+		assert!(
+			retried_at < Duration::from_secs(10),
+			"the failed rebalance held on for {retried_at:?}"
+		);
+	})
+	.await;
+}

@@ -12,6 +12,7 @@ use corepc_node::{Node as Bitcoind, get_available_port};
 use graduated_rebalancer::ReceivedLightningPayment;
 use ldk_node::lightning::ln::channelmanager;
 use ldk_node::lightning::ln::msgs::SocketAddress;
+use ldk_node::lightning::routing::router::RouteParametersConfig;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::{PaymentKind, PaymentStatus};
 use ldk_node::{Event, Node};
@@ -19,7 +20,7 @@ use rand::RngCore;
 use std::env::temp_dir;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
@@ -29,6 +30,8 @@ use uuid::Uuid;
 /// by keeping track of the balance and payments in memory.
 #[derive(Clone)]
 pub(crate) struct DummyTrustedWallet {
+	/// How many of the next BOLT 11 payments to fail on purpose (`fail_next_payments_for_tests`).
+	fail_next_payments: Arc<AtomicUsize>,
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,
 	ldk_node: Arc<Node>,
@@ -328,7 +331,13 @@ impl DummyTrustedWallet {
 			);
 		}
 
-		DummyTrustedWallet { current_bal_msats, payments, ldk_node, payment_success_flag }
+		DummyTrustedWallet {
+			fail_next_payments: Arc::new(AtomicUsize::new(0)),
+			current_bal_msats,
+			payments,
+			ldk_node,
+			payment_success_flag,
+		}
 	}
 
 	/// A dummy wallet around an ldk-node that is never started, for unit tests that make no
@@ -337,6 +346,7 @@ impl DummyTrustedWallet {
 	pub(crate) fn unstarted(ldk_node: Arc<Node>) -> Self {
 		let (_payment_success_sender, payment_success_flag) = watch::channel(());
 		DummyTrustedWallet {
+			fail_next_payments: Arc::new(AtomicUsize::new(0)),
 			current_bal_msats: Arc::new(AtomicU64::new(0)),
 			payments: Arc::new(RwLock::new(Vec::new())),
 			ldk_node,
@@ -431,6 +441,32 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		&self, method: PaymentMethod, amount: Amount,
 	) -> Pin<Box<dyn Future<Output = Result<[u8; 32], TrustedError>> + Send + '_>> {
 		Box::pin(async move {
+			if let PaymentMethod::LightningBolt11(inv) = &method {
+				let fail = self
+					.fail_next_payments
+					.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+					.is_ok();
+				if fail {
+					// No route can meet a CLTV limit of zero, so this send fails: at once (ldk-node
+					// then records it as failed under `PaymentId(payment_hash)`) or with a
+					// `PaymentFailed` event. Nothing is debited, as for a payment that failed and
+					// was refunded, and the payment is not listed.
+					let route_parameters = RouteParametersConfig {
+						max_total_cltv_expiry_delta: 0,
+						..Default::default()
+					};
+					let id = match self.ldk_node.bolt11_payment().send_using_amount(
+						inv,
+						amount.milli_sats(),
+						Some(route_parameters),
+					) {
+						Ok(id) => id.0,
+						Err(_) => inv.payment_hash().0,
+					};
+					return Ok(mangle_payment_id(id));
+				}
+			}
+
 			let id = match method {
 				PaymentMethod::LightningBolt11(inv) => {
 					let id = self
@@ -572,6 +608,34 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		})
 	}
 
+	fn await_payment_failure(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
+			// Our outbound BOLT 11 payment, stored under `PaymentId(payment_hash)`.
+			let id = channelmanager::PaymentId(payment_hash);
+			let mut flag = self.payment_success_flag.clone();
+			loop {
+				flag.mark_unchanged();
+				if let Ok(Some(payment)) = self.ldk_node.payment(&id) {
+					if payment.status == PaymentStatus::Failed {
+						return;
+					}
+				}
+				// The flag is signalled on every payment success and failure; poll as well, as a
+				// send that fails at once is recorded without an event.
+				match tokio::time::timeout(Duration::from_secs(1), flag.changed()).await {
+					Ok(Ok(())) | Err(_) => {},
+					Ok(Err(_)) => tokio::time::sleep(Duration::from_secs(1)).await,
+				}
+			}
+		})
+	}
+
+	fn fail_next_payments_for_tests(&self, count: usize) {
+		self.fail_next_payments.store(count, Ordering::SeqCst);
+	}
+
 	fn get_lightning_address(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
@@ -628,6 +692,7 @@ mod tests {
 		let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes([3; 64]);
 		let (_payment_success_sender, payment_success_flag) = watch::channel(());
 		let wallet = DummyTrustedWallet {
+			fail_next_payments: Arc::new(AtomicUsize::new(0)),
 			current_bal_msats: Arc::new(AtomicU64::new(0)),
 			payments: Arc::new(RwLock::new(Vec::new())),
 			ldk_node: Arc::new(builder.build(node_entropy).unwrap()),

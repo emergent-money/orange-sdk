@@ -1336,6 +1336,14 @@ impl Wallet {
 		Ok(Some((payment_hash, invoice)))
 	}
 
+	/// Test only: makes the trusted wallet's next `count` BOLT 11 payments fail on their way. Only
+	/// the dummy trusted wallet implements it.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn fail_next_trusted_payments_for_tests(&self, count: usize) {
+		self.inner.trusted.fail_next_payments_for_tests(count);
+	}
+
 	/// Test only: from now on, look up every received Lightning payment through the payment-store
 	/// search (as after a restart) instead of the ids recorded from `PaymentReceived` events.
 	#[cfg(feature = "_test-utils")]

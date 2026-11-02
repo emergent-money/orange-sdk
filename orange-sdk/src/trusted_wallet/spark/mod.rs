@@ -327,6 +327,40 @@ impl TrustedWalletInterface for Spark {
 		})
 	}
 
+	fn await_payment_failure(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
+			loop {
+				// A failed lookup, or a payment not listed yet, is no failure: look again later.
+				if let Ok(res) =
+					self.spark_wallet.list_payments(ListPaymentsRequest::default()).await
+				{
+					let mut statuses = res.payments.iter().filter_map(|p| match &p.details {
+						Some(PaymentDetails::Lightning { htlc_details, .. })
+							if p.payment_type == PaymentType::Send
+								&& <[u8; 32]>::from_hex(&htlc_details.payment_hash).ok()
+									== Some(payment_hash) =>
+						{
+							Some(p.status)
+						},
+						_ => None,
+					});
+					// Failed only if a payment for the hash is listed and every one has failed.
+					let first = statuses.next();
+					if first == Some(PaymentStatus::Failed)
+						&& statuses.all(|status| status == PaymentStatus::Failed)
+					{
+						return;
+					}
+				}
+				// Woken on payment successes; a failed rebalance payment is not signalled, so poll.
+				let _ = tokio::time::timeout(Duration::from_secs(10), self.await_payment_success())
+					.await;
+			}
+		})
+	}
+
 	fn get_lightning_address(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {

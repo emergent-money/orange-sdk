@@ -154,6 +154,22 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>>;
 
+	/// Resolves once our outgoing payment to `payment_hash` is known to have failed, and never if
+	/// it is not. Unlike a `None` from [`Self::await_payment_success`], which can also mean a
+	/// failed lookup, a payment not listed yet or a timeout, this must resolve only on a definite
+	/// failure: the rebalancer stops waiting for the payment's Lightning receipt when it does. The
+	/// default never resolves.
+	fn await_payment_failure(
+		&self, _payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(std::future::pending())
+	}
+
+	/// Test only: makes the next `count` BOLT 11 payments fail on their way, as when no route
+	/// satisfies them. Only the dummy trusted wallet implements it.
+	#[cfg(feature = "_test-utils")]
+	fn fail_next_payments_for_tests(&self, _count: usize) {}
+
 	/// Gets the lightning address for this wallet, if one is set.
 	fn get_lightning_address(
 		&self,
@@ -202,6 +218,12 @@ impl<T: ?Sized + TrustedWalletInterface> graduated_rebalancer::TrustedWallet for
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move { self.0.await_payment_success(payment_hash).await })
+	}
+
+	fn await_payment_failure(
+		&self, payment_hash: [u8; 32],
+	) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+		Box::pin(async move { self.0.await_payment_failure(payment_hash).await })
 	}
 }
 
