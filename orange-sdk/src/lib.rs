@@ -1349,6 +1349,15 @@ impl Wallet {
 		self.inner.rebalancer.set_trusted_failure_receipt_grace(grace);
 	}
 
+	/// Test only: an invoice on this node as the rebalancer asks for one.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub async fn rebalance_invoice_for_tests(
+		&self, amount: Amount,
+	) -> Result<Bolt11Invoice, WalletError> {
+		Ok(self.inner.ln_wallet.rebalance_invoice_for_tests(amount).await?)
+	}
+
 	/// Test only: from now on the trusted wallet reports no outcome for its payments, as Spark does
 	/// for a send it lists as failed after the payment was received. Only the dummy trusted wallet
 	/// implements it.

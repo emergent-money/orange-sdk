@@ -787,6 +787,11 @@ async fn test_receive_to_ln() {
 
 		let recv_amt = open_channel_from_lsp(&wallet, Arc::clone(&third_party)).await;
 		let channel = wallet.channels().into_iter().next().expect("expected a JIT channel");
+
+		// Rebalance invoices expire after a day too (see `REBALANCE_INVOICE_EXPIRY_SECS`).
+		let rebalance_invoice =
+			wallet.rebalance_invoice_for_tests(Amount::from_sats(10_000).unwrap()).await.unwrap();
+		assert_eq!(rebalance_invoice.expiry_time(), Duration::from_secs(86_400));
 		assert_eq!(
 			channel.feerate_sat_per_1000_weight, 0,
 			"JIT channel should use zero-fee commitments"

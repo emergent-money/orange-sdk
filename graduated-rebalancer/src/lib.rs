@@ -30,8 +30,13 @@ fn duration_to_millis(duration: Duration) -> u64 {
 ///
 /// LDK accepts a payment to one of its invoices until two hours after the invoice's expiry, as a
 /// buffer against block timestamps running ahead of real time (rust-lightning
-/// `inbound_payment.rs:271-280`, `calculate_absolute_expiry`), so the wait covers that window:
-/// no payment it could still accept arrives after the wait has ended.
+/// `inbound_payment.rs:271-280`, `calculate_absolute_expiry`), and the wait covers that window.
+/// LDK counts it from the highest block-header time it has seen, which may lead the wall clock by
+/// up to two hours, so a payment could still be accepted that long after the wait has ended.
+///
+/// With orange-sdk's 24 h rebalance invoices, a rebalance whose failure goes undetected holds the
+/// rebalancer for at most 26 h; one the trusted wallet reports failed, for seconds plus
+/// [`RebalanceTunables::trusted_failure_receipt_grace`].
 pub const RECEIPT_DEADLINE_GRACE: Duration = Duration::from_secs(7_200);
 
 /// When the rebalancer stops waiting for the payment to `invoice` to be received: the invoice's
@@ -844,10 +849,10 @@ mod tests {
 	}
 
 	/// The wait for a rebalance payment ends two hours after its invoice expires, when LDK stops
-	/// accepting payments to it.
+	/// accepting payments to it: 26 h after a 24 h rebalance invoice is created.
 	#[test]
 	fn receipt_deadline_is_the_invoice_expiry_plus_ldks_acceptance_window() {
-		let one_hour = invoice(Duration::from_secs(3_600));
-		assert_eq!(receipt_deadline(&one_hour), Duration::from_secs(1_700_000_000 + 3_600 + 7_200));
+		let one_day = invoice(Duration::from_secs(86_400));
+		assert_eq!(receipt_deadline(&one_day), Duration::from_secs(1_700_000_000 + 86_400 + 7_200));
 	}
 }

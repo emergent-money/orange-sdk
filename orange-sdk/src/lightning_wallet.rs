@@ -61,11 +61,18 @@ pub(crate) struct LightningWallet {
 
 const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 
-/// The expiry of the invoices the rebalancer has our trusted wallet pay. It pays them at once
-/// and a JIT channel open takes well under a minute, so an hour is ample. It also bounds how long
-/// the rebalancer can wait for a payment that failed without our learning of it, see
-/// [`graduated_rebalancer::RECEIPT_DEADLINE_GRACE`].
-const REBALANCE_INVOICE_EXPIRY_SECS: u32 = 3_600;
+/// The expiry of the invoices the rebalancer has our trusted wallet pay: the same 24 h as other
+/// receives. Not shorter: Breez resumes a pending Spark send on every wallet sync, so a send can
+/// be retried long after it was started, and whether the operator then fails the swap or keeps
+/// the transfer locked (until its 16-day expiry) when the invoice has expired is unverified.
+///
+/// This bounds how long the rebalancer waits for a rebalance payment whose failure goes
+/// undetected: the invoice's expiry plus [`graduated_rebalancer::RECEIPT_DEADLINE_GRACE`], so at
+/// most 26 h. LDK measures its own acceptance window from block-header time, which may lead the
+/// wall clock by up to 2 h, so a payment could still be accepted up to 2 h after that. A failure
+/// the trusted wallet reports releases the rebalancer within seconds plus the trusted-failure
+/// receipt grace.
+const REBALANCE_INVOICE_EXPIRY_SECS: u32 = 86_400;
 
 impl LightningWallet {
 	pub(super) async fn init(
@@ -408,6 +415,14 @@ impl LightningWallet {
 			InboundReceipt::Received(payment) => Some(payment.id),
 			InboundReceipt::Failed | InboundReceipt::NotYet => None,
 		})
+	}
+
+	/// Test only: an invoice as the rebalancer asks for one.
+	#[cfg(feature = "_test-utils")]
+	pub(crate) async fn rebalance_invoice_for_tests(
+		&self, amount: Amount,
+	) -> Result<Bolt11Invoice, NodeError> {
+		graduated_rebalancer::LightningWallet::get_bolt11_invoice(self, Some(amount)).await
 	}
 
 	/// Lists every payment in the node's payment store, newest first, walking all its pages.
@@ -1508,5 +1523,13 @@ mod tests {
 				"scan 2 read {second_reads} payments, scan 1 {first_reads}"
 			);
 		}
+	}
+
+	/// Both invoice expiries, pinned so that a change is deliberate: see the docs of
+	/// `REBALANCE_INVOICE_EXPIRY_SECS` for why rebalance invoices do not expire sooner.
+	#[test]
+	fn invoice_expiries() {
+		assert_eq!(DEFAULT_INVOICE_EXPIRY_SECS, 86_400);
+		assert_eq!(REBALANCE_INVOICE_EXPIRY_SECS, 86_400);
 	}
 }
