@@ -38,7 +38,16 @@ fn duration_to_millis(duration: Duration) -> u64 {
 /// rebalancer for at most 26 h. One the trusted wallet reports failed holds it for seconds plus
 /// [`RebalanceTunables::trusted_failure_receipt_grace`], whether or not a receipt then lands and
 /// whether or not the trusted wallet ever reports an outcome (Cashu does not, for a failed melt).
+/// Once the receipt is in hand with no failure reported, at most another 10 min
+/// (`TRUSTED_VERDICT_WAIT`) for the trusted wallet's verdict.
 pub const RECEIPT_DEADLINE_GRACE: Duration = Duration::from_secs(7_200);
+
+/// With a rebalance's Lightning receipt in hand and no trusted failure reported, how long the
+/// rebalancer still waits for the trusted wallet's verdict. The verdict then only supplies the
+/// trusted fee, which is informational, so it must not hold the rebalancer for long: a Cashu
+/// melt whose confirm failed without a definite verdict, or a slow Spark listing, could otherwise
+/// keep it until the receipt deadline.
+const TRUSTED_VERDICT_WAIT: Duration = Duration::from_secs(600);
 
 /// When the rebalancer stops waiting for the payment to `invoice` to be received: the invoice's
 /// expiry plus [`RECEIPT_DEADLINE_GRACE`], as a time since the Unix epoch. Without an expiry that
@@ -424,10 +433,9 @@ where
 					let mut receipt =
 						self.ln_wallet.await_payment_receipt(expected_hash.0, receipt_deadline);
 					let trusted_failure = self.trusted.await_payment_failure(expected_hash.0);
-					// How long to wait for the trusted side's verdict once the receipt is in
-					// hand: to the receipt's deadline, or to the end of the grace if the trusted
-					// side already reported a failure.
-					let mut verdict_deadline = deadline;
+					// When to stop waiting for the trusted side's verdict once the receipt is in
+					// hand, if the trusted side already reported a failure: the end of the grace.
+					let mut verdict_deadline = None;
 					let receipt = tokio::select! {
 						biased;
 						receipt = &mut receipt => receipt,
@@ -442,7 +450,7 @@ where
 								"Rebalance payment failed on the trusted side; waiting up to {grace:?} for a Lightning receipt in case it was received anyway"
 							);
 							let grace_end = tokio::time::Instant::now() + grace;
-							verdict_deadline = grace_end.min(deadline);
+														verdict_deadline = Some(grace_end.min(deadline));
 							match tokio::time::timeout_at(grace_end, &mut receipt).await {
 								Ok(Some(receipt)) => {
 									log_warn!(
@@ -478,8 +486,12 @@ where
 					// us), history then shows a transfer without a trusted debit; the next listing
 					// of the trusted balance still gets balances right. That beats waiting on the
 					// verdict for good, as before. So the wait is bounded, by the rest of the grace
-					// once a failure was reported and by the receipt's deadline otherwise, and
-					// without a verdict the rebalance is recorded with the trusted fee unknown.
+					// once a failure was reported and by `TRUSTED_VERDICT_WAIT` otherwise (never
+					// past the receipt's deadline), and without a verdict the rebalance is
+					// recorded with the trusted fee unknown.
+					let verdict_deadline = verdict_deadline.unwrap_or_else(|| {
+						(tokio::time::Instant::now() + TRUSTED_VERDICT_WAIT).min(deadline)
+					});
 					let trusted_fee_msat = match tokio::time::timeout_at(
 						verdict_deadline,
 						self.trusted.await_payment_success(expected_hash.0),
@@ -853,14 +865,18 @@ mod tests {
 	}
 
 	/// Without a trusted failure the receipt completes the rebalance, however long it takes, and
-	/// a trusted side that reports failure or nothing afterwards does not undo it.
+	/// a trusted side that reports failure or nothing afterwards does not undo it. Its verdict,
+	/// which only supplies the trusted fee, is waited for at most 10 minutes.
 	#[tokio::test(start_paused = true)]
 	async fn a_receipt_without_a_trusted_failure_completes_the_rebalance() {
 		let secs = Duration::from_secs;
 		let receipt = Some(secs(600));
 		assert_eq!(rebalance(None, receipt, Verdict::Succeeded).await, (secs(600), Some(1_500)));
 		assert_eq!(rebalance(None, receipt, Verdict::Failed).await, (secs(600), Some(1_000)));
-		let (elapsed, fee) = rebalance(None, receipt, Verdict::Never).await;
+		assert_eq!(rebalance(None, receipt, Verdict::Never).await, (secs(1_200), Some(1_000)));
+		// Nor past the receipt deadline, for a receipt that lands a minute before it.
+		let late_receipt = INVOICE_EXPIRY + RECEIPT_DEADLINE_GRACE - secs(60);
+		let (elapsed, fee) = rebalance(None, Some(late_receipt), Verdict::Never).await;
 		assert_eq!(fee, Some(1_000));
 		assert_ended_at_the_deadline(elapsed);
 	}

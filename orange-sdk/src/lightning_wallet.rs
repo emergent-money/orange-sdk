@@ -72,7 +72,8 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 /// wall clock by up to 2 h, so a payment could still be accepted up to 2 h after that. A failure
 /// the trusted wallet reports releases the rebalancer within seconds plus the trusted-failure
 /// receipt grace, also when the trusted wallet then never reports an outcome (Cashu, for a failed
-/// melt).
+/// melt). Once the payment's receipt is in hand with no failure reported, the rebalancer waits at
+/// most another 10 minutes for the trusted wallet's verdict, which only supplies its fee.
 const REBALANCE_INVOICE_EXPIRY_SECS: u32 = 86_400;
 
 impl LightningWallet {
