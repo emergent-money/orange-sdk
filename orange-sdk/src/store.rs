@@ -563,26 +563,28 @@ impl TxMetadataStore {
 		Ok(())
 	}
 
-	/// Atomically records a trusted-to-Lightning transfer: marks `trigger_id` as the payment that
-	/// triggered it and writes `transfer_metadata` for both its Lightning payment (`lightning_id`,
-	/// which must not have metadata yet) and its trusted payment (`trusted_id`, replacing its
-	/// pending-rebalance placeholder).
+	/// Records a trusted-to-Lightning transfer: marks `trigger_id` as the payment that triggered it
+	/// and writes `transfer_metadata` for both its Lightning payment (`lightning_id`, which must not
+	/// have metadata yet) and its trusted payment (`trusted_id`, replacing its pending-rebalance
+	/// placeholder).
 	///
-	/// As in [`Self::set_tx_caused_rebalance_with_splice`], the in-memory updates happen under a
-	/// single write lock, so a concurrent `list_transactions` sees all three or none. It lists the
-	/// payments of both wallets before it reads this metadata, so with the writes one at a time it
-	/// could see a record without the payment it is keyed on (a Lightning receipt that arrived
-	/// after its payment listing, or a trusted send the trusted wallet does not list yet) and be
-	/// unable to place the transfer, which debug builds assert on. This also closes the window
-	/// between the trigger's promotion and the transfer records (#1281) for in-memory readers.
+	/// What keeps readers correct is the order and the listing's rule, not the lock: the trigger is
+	/// promoted first, in memory and on disk, and `list_transactions` places a transfer from its
+	/// promoted trigger and shows the fees of whichever legs it has listed. Every prefix of these
+	/// writes (trigger; trigger and Lightning; all three) is therefore a state the listing shows
+	/// correctly, and it is also what a crash between the persisted writes leaves. A transfer leg's
+	/// record without its promoted trigger is the one state that would mislist (the trigger as a
+	/// plain payment, the leg dropped), and promotion first rules it out.
 	///
-	/// The three keys are persisted in that order (trigger, Lightning, trusted); a crash between
-	/// them can still leave a partial state on disk.
+	/// The single write lock over the in-memory updates, as in
+	/// [`Self::set_tx_caused_rebalance_with_splice`], is defence in depth: a concurrent reader sees
+	/// all three records or none. Persistence is not atomic: the three keys are written one at a
+	/// time, in that order (trigger, Lightning, trusted).
 	pub(crate) async fn set_tx_caused_rebalance_with_transfer(
 		&self, trigger_id: &PaymentId, lightning_id: PaymentId, trusted_id: PaymentId,
 		transfer_metadata: TxMetadata,
 	) -> Result<(), ()> {
-		let writes = {
+		let (writes, had_lightning) = {
 			let mut tx_metadata = self.tx_metadata.write().unwrap();
 			let trigger = match tx_metadata.get_mut(trigger_id) {
 				Some(metadata) => {
@@ -600,15 +602,18 @@ impl TxMetadataStore {
 				},
 			};
 			let had_lightning = tx_metadata.insert(lightning_id, transfer_metadata).is_some();
-			debug_assert!(!had_lightning);
 			tx_metadata.insert(trusted_id, transfer_metadata);
 			let encoded = transfer_metadata.encode();
-			[
+			let writes = [
 				trigger,
 				(lightning_id.to_string(), encoded.clone()),
 				(trusted_id.to_string(), encoded),
-			]
+			];
+			(writes, had_lightning)
 		};
+		// Asserted only once the write guard is dropped: a panic while it is held would poison
+		// the lock, and every later read or write of the metadata would panic too.
+		debug_assert!(!had_lightning, "{lightning_id} already had metadata");
 		for (key, value) in writes {
 			KVStore::write(
 				self.store.as_ref(),
@@ -1042,6 +1047,49 @@ mod tests {
 	async fn insert_legs(tx_metadata: &TxMetadataStore) {
 		tx_metadata.insert(surface_id(), mpp_metadata()).await;
 		tx_metadata.insert(lightning_id(), mpp_metadata()).await;
+	}
+
+	// A transfer whose Lightning payment already has metadata trips a debug assert. It must fire
+	// with the write guard dropped: a panic under the guard would poison the lock, and every later
+	// metadata read or write would panic too.
+	#[cfg(debug_assertions)]
+	#[tokio::test]
+	async fn transfer_record_assert_leaves_the_metadata_lock_usable() {
+		let (_path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(store).await;
+		let trigger = PaymentId::Trusted([1u8; 32]);
+		let payment = TxMetadata {
+			ty: TxType::Payment { ty: PaymentType::IncomingLightning {} },
+			time: Duration::from_secs(1),
+		};
+		tx_metadata.insert(trigger, payment).await;
+		tx_metadata.insert(lightning_id(), payment).await;
+		let transfer = TxMetadata {
+			ty: TxType::TrustedToLightning {
+				trusted_payment: [2u8; 32],
+				lightning_payment: LIGHTNING_LEG,
+				payment_triggering_transfer: trigger,
+			},
+			time: Duration::from_secs(2),
+		};
+
+		let writer = tx_metadata.clone();
+		let recorded = tokio::spawn(async move {
+			writer
+				.set_tx_caused_rebalance_with_transfer(
+					&trigger,
+					lightning_id(),
+					PaymentId::Trusted([2u8; 32]),
+					transfer,
+				)
+				.await
+		})
+		.await;
+		assert!(recorded.expect_err("the debug assert fires").is_panic());
+
+		assert!(!tx_metadata.tx_metadata.is_poisoned());
+		assert_eq!(tx_metadata.read().get(&lightning_id()).map(|m| m.ty), Some(transfer.ty));
+		tx_metadata.insert(PaymentId::Trusted([3u8; 32]), payment).await;
 	}
 
 	#[tokio::test]

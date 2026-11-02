@@ -390,10 +390,11 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 						},
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
-					// The trigger's promotion and both transfer records land in one critical
-					// section: a `list_transactions` that listed the payments before (and so may
-					// miss the Lightning receipt) and reads the metadata during these writes must
-					// see all of them or none, or it cannot place the transfer (see
+					// The trigger is promoted before the transfer records are written, so a
+					// `list_transactions` that reads the metadata at any point, or a restart after a
+					// crash between the writes, places the transfer from its promoted trigger and
+					// shows the fees of whichever legs it has listed. One write lock over the
+					// in-memory updates is defence in depth; persistence is not atomic (see
 					// `set_tx_caused_rebalance_with_transfer`). `lightning_id` is the id ldk-node
 					// stored the received payment under (derived from its HTLCs, not the payment
 					// hash), as `list_transactions` looks it up.
