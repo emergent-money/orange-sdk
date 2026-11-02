@@ -7,6 +7,7 @@ use ldk_node::bitcoin::hashes::Hash;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::{OutPoint, Txid};
 use ldk_node::lightning::events::{ClosureReason, PaymentFailureReason};
+use ldk_node::lightning::ln::channelmanager::PaymentId as LdkPaymentId;
 use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
@@ -550,7 +551,7 @@ impl LdkEventHandler {
 				bolt12_invoice: _,
 			} => {
 				let preimage = payment_preimage.unwrap(); // safe
-				let payment_id = PaymentId::SelfCustodial(payment_id.unwrap().0); // safe
+				let payment_id = PaymentId::SelfCustodial(payment_id.0);
 
 				if self.tx_metadata.set_preimage(payment_id, preimage.0).await.is_err() {
 					log_error!(self.logger, "Failed to set preimage for payment {payment_id:?}");
@@ -574,7 +575,7 @@ impl LdkEventHandler {
 				if let Err(e) = self
 					.event_queue
 					.add_event(Event::PaymentFailed {
-						payment_id: PaymentId::SelfCustodial(payment_id.unwrap().0), // safe
+						payment_id: PaymentId::SelfCustodial(payment_id.0),
 						payment_hash,
 						reason,
 					})
@@ -590,14 +591,25 @@ impl LdkEventHandler {
 				amount_msat,
 				custom_records,
 			} => {
-				let payment_id = payment_id.expect("this is safe");
-				let lsp_fee_msats = self.ldk_node.payment(&payment_id).and_then(|p| {
-					if let PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } = p.kind {
-						counterparty_skimmed_fee_msat
-					} else {
+				// The fee is informational, so a failed store read must not hold back the event:
+				// it is logged and the event carries no fee.
+				let lsp_fee_msats = match self.ldk_node.payment(&payment_id) {
+					Ok(Some(p)) => {
+						if let PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } = p.kind {
+							counterparty_skimmed_fee_msat
+						} else {
+							None
+						}
+					},
+					Ok(None) => None,
+					Err(e) => {
+						log_error!(
+							self.logger,
+							"Failed to read received payment {payment_id} for its LSP fee: {e}"
+						);
 						None
-					}
-				});
+					},
+				};
 
 				if let Err(e) = self
 					.event_queue
@@ -619,8 +631,14 @@ impl LdkEventHandler {
 				let _ = self.payment_receipt_sender.send(());
 			},
 			ldk_node::Event::PaymentForwarded { .. } => {},
-			ldk_node::Event::PaymentClaimable { payment_hash, claimable_amount_msat, .. } => {
-				self.handle_payment_claimable(payment_hash, claimable_amount_msat).await;
+			ldk_node::Event::PaymentClaimable {
+				payment_id,
+				payment_hash,
+				claimable_amount_msat,
+				..
+			} => {
+				self.handle_payment_claimable(payment_id, payment_hash, claimable_amount_msat)
+					.await;
 			},
 			ldk_node::Event::ChannelPending { funding_txo, .. } => {
 				log_debug!(self.logger, "Received ChannelPending event");
@@ -722,7 +740,7 @@ impl LdkEventHandler {
 	/// the amount requested, whose trusted leg has not been paid. Failing back is always safe: the
 	/// payer can still pay the trusted leg.
 	async fn handle_payment_claimable(
-		&self, payment_hash: PaymentHash, claimable_amount_msat: u64,
+		&self, payment_id: LdkPaymentId, payment_hash: PaymentHash, claimable_amount_msat: u64,
 	) {
 		let entry = match store::read_wrapped_receive(&*self.store, &payment_hash).await {
 			Ok(Some(entry)) => entry,
@@ -731,7 +749,7 @@ impl LdkEventHandler {
 					self.logger,
 					"Failing back claimable payment {payment_hash}: not a pending wrapped receive"
 				);
-				self.fail_claimable_payment(payment_hash);
+				self.fail_claimable_payment(payment_id, payment_hash);
 				return;
 			},
 			Err(e) => {
@@ -739,7 +757,7 @@ impl LdkEventHandler {
 					self.logger,
 					"Failing back claimable payment {payment_hash}: failed to read wrapped receive: {e}"
 				);
-				self.fail_claimable_payment(payment_hash);
+				self.fail_claimable_payment(payment_id, payment_hash);
 				return;
 			},
 		};
@@ -750,7 +768,7 @@ impl LdkEventHandler {
 				"Failing back wrapped receive {payment_hash}: claimable {claimable_amount_msat} msat is below the requested {} msat",
 				entry.amount_msat
 			);
-			self.fail_claimable_payment(payment_hash);
+			self.fail_claimable_payment(payment_id, payment_hash);
 			return;
 		}
 
@@ -764,7 +782,7 @@ impl LdkEventHandler {
 				if let Err(e) = store::remove_wrapped_receive(&*self.store, &payment_hash).await {
 					log_error!(self.logger, "Failed to remove wrapped receive {payment_hash}: {e}");
 				}
-				self.fail_claimable_payment(payment_hash);
+				self.fail_claimable_payment(payment_id, payment_hash);
 				return;
 			},
 			Err(e) => {
@@ -772,19 +790,17 @@ impl LdkEventHandler {
 					self.logger,
 					"Failing back wrapped receive {payment_hash}: failed to check its trusted leg: {e}"
 				);
-				self.fail_claimable_payment(payment_hash);
+				self.fail_claimable_payment(payment_id, payment_hash);
 				return;
 			},
 		}
 
 		let preimage = PaymentPreimage(entry.preimage);
-		if let Err(e) = self.ldk_node.bolt11_payment().claim_for_hash(
-			payment_hash,
-			claimable_amount_msat,
-			preimage,
-		) {
+		// `claim_for_id` checks only that the preimage matches the payment's hash, not the amount:
+		// the amount check above is the only one.
+		if let Err(e) = self.ldk_node.bolt11_payment().claim_for_id(payment_id, preimage) {
 			log_error!(self.logger, "Failed to claim wrapped receive {payment_hash}: {e}");
-			self.fail_claimable_payment(payment_hash);
+			self.fail_claimable_payment(payment_id, payment_hash);
 		}
 	}
 
@@ -804,8 +820,8 @@ impl LdkEventHandler {
 		}
 	}
 
-	fn fail_claimable_payment(&self, payment_hash: PaymentHash) {
-		if let Err(e) = self.ldk_node.bolt11_payment().fail_for_hash(payment_hash) {
+	fn fail_claimable_payment(&self, payment_id: LdkPaymentId, payment_hash: PaymentHash) {
+		if let Err(e) = self.ldk_node.bolt11_payment().fail_for_id(payment_id) {
 			log_error!(self.logger, "Failed to fail back claimable payment {payment_hash}: {e}");
 		}
 	}

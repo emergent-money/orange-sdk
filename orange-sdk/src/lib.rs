@@ -854,7 +854,7 @@ impl Wallet {
 			store::read_splice_outs(self.inner.store.as_ref())
 		);
 		let trusted_payments = trusted_payments?;
-		let mut lightning_payments = self.inner.ln_wallet.list_payments();
+		let mut lightning_payments = self.inner.ln_wallet.list_payments()?;
 		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
 
 		let mut res = Vec::with_capacity(

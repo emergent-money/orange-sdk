@@ -101,7 +101,7 @@ impl DummyTrustedWallet {
 						bolt12_invoice: _,
 					} => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
 
 						let mut payments = pays.write().await;
 						let item = payments.iter_mut().find(|p| p.id == id);
@@ -142,7 +142,7 @@ impl DummyTrustedWallet {
 					},
 					Event::PaymentFailed { payment_id, payment_hash, reason } => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
 
 						let mut payments = pays.write().await;
 						let item = payments.iter().cloned().enumerate().find(|(_, p)| p.id == id);
@@ -174,7 +174,7 @@ impl DummyTrustedWallet {
 					},
 					Event::PaymentReceived { payment_id, amount_msat, payment_hash, .. } => {
 						// convert id
-						let id = mangle_payment_id(payment_id.unwrap().0);
+						let id = mangle_payment_id(payment_id.0);
 
 						let mut payments = pays.write().await;
 						// We create invoices on the fly without adding the payment to our list
@@ -236,7 +236,14 @@ impl DummyTrustedWallet {
 		let lsp_clone = Arc::clone(&lsp);
 		let ldk_node_id = ldk_node.node_id();
 		blocking_with_timeout("dummy LSP channel open", Duration::from_secs(30), move || {
-			lsp_clone.open_channel(ldk_node_id, socket_addr, 1_000_000, Some(500_000_000), None)
+			lsp_clone.open_channel(
+				ldk_node_id,
+				socket_addr,
+				1_000_000,
+				Some(500_000_000),
+				None,
+				None,
+			)
 		})
 		.await
 		.unwrap();
@@ -513,7 +520,14 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 			let mut flag = self.payment_success_flag.clone();
 			flag.mark_unchanged();
 			loop {
-				if let Some(payment) = self.ldk_node.payment(&id) {
+				let payment = match self.ldk_node.payment(&id) {
+					Ok(payment) => payment,
+					Err(e) => {
+						eprintln!("dummy: failed to read payment {id}: {e}");
+						return None;
+					},
+				};
+				if let Some(payment) = payment {
 					let counterparty_skimmed_fee_msat = match payment.kind {
 						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
 							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");

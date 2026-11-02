@@ -192,7 +192,9 @@ impl LightningWallet {
 
 		builder.set_custom_logger(Arc::clone(&logger) as Arc<dyn ldk_node::logger::LogWriter>);
 
-		builder.set_runtime(runtime.get_handle());
+		// ldk-node now refuses a runtime that is not multi-threaded (its blocking calls use
+		// `block_in_place`). Fail initialization rather than let it run on a different runtime.
+		builder.set_runtime(runtime.get_handle())?;
 
 		if let Some(url) = config.scorer_url {
 			builder.set_pathfinding_scores_source(url);
@@ -317,8 +319,21 @@ impl LightningWallet {
 			.map(Some)
 	}
 
-	pub(crate) fn list_payments(&self) -> Vec<PaymentDetails> {
-		self.inner.ldk_node.list_payments()
+	/// Lists every payment in the node's payment store, newest first, walking all its pages.
+	///
+	/// The store keeps only recently used payments in memory, so this reads the rest from the
+	/// KV store; a failed read fails the whole listing rather than returning part of it.
+	pub(crate) fn list_payments(&self) -> Result<Vec<PaymentDetails>, NodeError> {
+		let mut payments = Vec::new();
+		let mut page_token = None;
+		loop {
+			let page = self.inner.ldk_node.list_payments(page_token)?;
+			payments.extend(page.payments);
+			match page.next_page_token {
+				Some(token) => page_token = Some(token),
+				None => return Ok(payments),
+			}
+		}
 	}
 
 	pub(crate) fn get_balance(&self) -> LightningWalletBalance {
@@ -386,11 +401,14 @@ impl LightningWallet {
 							Err(NodeError::InsufficientFunds)
 						},
 						Some(chan) => {
+							// No minimum fee rate: as before, ldk-node uses its channel-funding
+							// estimate.
 							self.inner.ldk_node.splice_out(
 								&chan.user_channel_id,
 								chan.counterparty.node_id,
 								address,
 								amount_sats,
+								None,
 							)?;
 
 							let funding_txo =
@@ -443,9 +461,12 @@ impl LightningWallet {
 
 		match channel {
 			Some(chan) => {
-				self.inner
-					.ldk_node
-					.splice_in_with_all(&chan.user_channel_id, chan.counterparty.node_id)?;
+				// No minimum fee rate: as before, ldk-node uses its channel-funding estimate.
+				self.inner.ldk_node.splice_in_with_all(
+					&chan.user_channel_id,
+					chan.counterparty.node_id,
+					None,
+				)?;
 				Ok(chan.user_channel_id)
 			},
 			None => {
@@ -456,9 +477,12 @@ impl LightningWallet {
 	}
 
 	pub(crate) async fn open_channel_with_lsp(&self) -> Result<UserChannelId, NodeError> {
+		// No push amount, no fee rate (as before, ldk-node uses its channel-funding estimate) and
+		// the default channel config.
 		let id = self.inner.ldk_node.open_channel_with_all(
 			self.inner.lsp_node_id,
 			self.inner.lsp_socket_addr.clone(),
+			None,
 			None,
 			None,
 		)?;
@@ -525,7 +549,17 @@ impl graduated_rebalancer::LightningWallet for LightningWallet {
 		Box::pin(async move {
 			let id = PaymentId(payment_hash);
 			loop {
-				if let Some(payment) = self.inner.ldk_node.payment(&id) {
+				let payment = match self.inner.ldk_node.payment(&id) {
+					Ok(payment) => payment,
+					Err(e) => {
+						log_error!(
+							self.inner.logger,
+							"Failed to read rebalance payment {id} while waiting for it: {e}"
+						);
+						return None;
+					},
+				};
+				if let Some(payment) = payment {
 					let counterparty_skimmed_fee_msat = match payment.kind {
 						PaymentKind::Bolt11 { hash, counterparty_skimmed_fee_msat, .. } => {
 							debug_assert!(hash.0 == payment_hash, "Payment Hash mismatch");

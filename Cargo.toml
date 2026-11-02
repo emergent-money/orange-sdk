@@ -16,9 +16,9 @@ codegen-units = 1   # Reduce number of codegen units to increase optimizations.
 panic = 'abort'     # Abort on panic
 
 [workspace.dependencies]
-bitcoin-payment-instructions = { git = "https://github.com/tnull/bitcoin-payment-instructions", rev = "0e430be98c09540624a68a68022ee0551e86d1be" }
-lightning = { git = "https://github.com/lightningdevkit/rust-lightning", rev = "506cb91f2e0fb87906188b79777bcf42595d3623" }
-lightning-invoice = { git = "https://github.com/lightningdevkit/rust-lightning", rev = "506cb91f2e0fb87906188b79777bcf42595d3623" }
+bitcoin-payment-instructions = { git = "https://github.com/benthecarman/bitcoin-payment-instructions", rev = "3dbe11bdf8916639df42476501fb40f87b253e84" }
+lightning = { git = "https://github.com/lightningdevkit/rust-lightning", rev = "d7a980641c6325ddda5072a0f470ef8392676cf5" }
+lightning-invoice = { git = "https://github.com/lightningdevkit/rust-lightning", rev = "d7a980641c6325ddda5072a0f470ef8392676cf5" }
 
 [profile.release]
 panic = "abort"

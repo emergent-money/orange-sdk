@@ -13,7 +13,7 @@ use electrsd::ElectrsD;
 use electrsd::electrum_client::ElectrumApi;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::liquidity::LSPS2ServiceConfig;
-use ldk_node::payment::PaymentStatus;
+use ldk_node::payment::{PaymentDetails, PaymentStatus};
 use ldk_node::{Node, bitcoin};
 use orange_sdk::bitcoin::Txid;
 #[cfg(not(feature = "_cashu-tests"))]
@@ -32,6 +32,21 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// Lists every payment `node` has stored, newest first, walking all pages of
+/// [`Node::list_payments`]. Panics if the payment store cannot be read.
+pub fn list_all_payments(node: &Node) -> Vec<PaymentDetails> {
+	let mut payments = Vec::new();
+	let mut page_token = None;
+	loop {
+		let page = node.list_payments(page_token).expect("payment store read");
+		payments.extend(page.payments);
+		match page.next_page_token {
+			Some(token) => page_token = Some(token),
+			None => return payments,
+		}
+	}
+}
 
 /// Waits for an async condition to be true, polling with exponential backoff until a timeout.
 pub async fn wait_for_condition<F, Fut>(condition_name: &str, mut condition: F)
@@ -455,7 +470,9 @@ async fn build_test_nodes() -> TestParams {
 
 	// open a channel from payer to LSP
 	log::info!("opening third-party channel to LSP for {test_id}");
-	third_party.open_channel(lsp.node_id(), lsp_listen.clone(), 10_000_000, None, None).unwrap();
+	third_party
+		.open_channel(lsp.node_id(), lsp_listen.clone(), 10_000_000, None, None, None)
+		.unwrap();
 	wait_for_tx_broadcast(&bitcoind).await;
 	generate_blocks(&bitcoind, &electrsd, 6).await;
 
@@ -683,7 +700,10 @@ pub async fn open_channel_from_lsp(wallet: &orange_sdk::Wallet, payer: Arc<Node>
 	// wait for payment success from payer side
 	let p = Arc::clone(&payer);
 	wait_for_condition("payer payment success", || {
-		let res = p.payment(&payment_id).is_some_and(|p| p.status == PaymentStatus::Succeeded);
+		let res = p
+			.payment(&payment_id)
+			.expect("payment store read")
+			.is_some_and(|p| p.status == PaymentStatus::Succeeded);
 		async move { res }
 	})
 	.await;
