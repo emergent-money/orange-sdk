@@ -290,9 +290,9 @@ pub(crate) struct OrangeRebalanceEventHandler {
 	event_queue: Arc<EventQueue>,
 	/// Logger for logging events and errors.
 	logger: Arc<Logger>,
-	/// Test only: a pause between the two transfer records of a `RebalanceSuccessful`.
+	/// Test only: a pause right after a `RebalanceSuccessful`'s transfer is recorded.
 	#[cfg(feature = "_test-utils")]
-	pub(crate) record_pause: Arc<TransferRecordPause>,
+	pub(crate) record_pause: Arc<TestPause>,
 }
 
 impl OrangeRebalanceEventHandler {
@@ -310,18 +310,19 @@ impl OrangeRebalanceEventHandler {
 	}
 }
 
-/// Test only: makes the next `RebalanceSuccessful` stop after writing the first of its two
-/// transfer records until resumed, so a test can list transactions while only that one exists.
+/// Test only: a point where, once armed, the next task to reach it stops until resumed. Used to
+/// stop a `RebalanceSuccessful` right after its transfer is recorded, and `list_transactions`
+/// between its payment listing and its metadata snapshot.
 #[cfg(feature = "_test-utils")]
 #[derive(Default)]
-pub(crate) struct TransferRecordPause {
+pub(crate) struct TestPause {
 	armed: std::sync::atomic::AtomicBool,
 	first_written: tokio::sync::Notify,
 	resume: tokio::sync::Notify,
 }
 
 #[cfg(feature = "_test-utils")]
-impl TransferRecordPause {
+impl TestPause {
 	pub(crate) fn arm(&self) {
 		self.armed.store(true, Ordering::SeqCst);
 	}
@@ -335,7 +336,7 @@ impl TransferRecordPause {
 		self.resume.notify_one();
 	}
 
-	async fn pause_if_armed(&self) {
+	pub(crate) async fn pause_if_armed(&self) {
 		if self.armed.swap(false, Ordering::SeqCst) {
 			self.first_written.notify_one();
 			self.resume.notified().await;
@@ -381,10 +382,6 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 					fee_msat,
 				} => {
 					let triggering_transaction_id = PaymentId::Trusted(trigger_id);
-					self.tx_metadata
-						.set_tx_caused_rebalance(&triggering_transaction_id)
-						.await
-						.expect("Failed to write metadata for rebalance transaction");
 					let metadata = TxMetadata {
 						ty: TxType::TrustedToLightning {
 							trusted_payment: rebalance_id,
@@ -393,20 +390,24 @@ impl graduated_rebalancer::EventHandler for OrangeRebalanceEventHandler {
 						},
 						time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
 					};
-					// The Lightning record goes first. The Lightning receive is always listed once
-					// its receipt exists, so the transfer entry `list_transactions` builds from it
-					// is marked trusted-to-Lightning (and may then lack a send fee) before the
-					// trusted record appears. The trusted send can be unlisted (Cashu, a melt not
-					// finalized as paid): with the trusted record alone, the entry would have
-					// neither, and debug builds would assert, for good if the process died between
-					// the two writes. `lightning_id` is the id ldk-node stored the received
-					// payment under (derived from its HTLCs, not the payment hash), as
-					// `list_transactions` looks it up. The window between
-					// `set_tx_caused_rebalance` above and this write is #1281's, a separate issue.
-					self.tx_metadata.insert(PaymentId::SelfCustodial(lightning_id), metadata).await;
+					// The trigger's promotion and both transfer records land in one critical
+					// section: a `list_transactions` that listed the payments before (and so may
+					// miss the Lightning receipt) and reads the metadata during these writes must
+					// see all of them or none, or it cannot place the transfer (see
+					// `set_tx_caused_rebalance_with_transfer`). `lightning_id` is the id ldk-node
+					// stored the received payment under (derived from its HTLCs, not the payment
+					// hash), as `list_transactions` looks it up.
+					self.tx_metadata
+						.set_tx_caused_rebalance_with_transfer(
+							&triggering_transaction_id,
+							PaymentId::SelfCustodial(lightning_id),
+							PaymentId::Trusted(rebalance_id),
+							metadata,
+						)
+						.await
+						.expect("Failed to write metadata for rebalance transaction");
 					#[cfg(feature = "_test-utils")]
 					self.record_pause.pause_if_armed().await;
-					self.tx_metadata.upsert(PaymentId::Trusted(rebalance_id), metadata).await;
 
 					let event_queue = Arc::clone(&self.event_queue);
 					let logger = Arc::clone(&self.logger);

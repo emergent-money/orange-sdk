@@ -384,7 +384,7 @@ async fn test_pay_mpp_trusted_and_lightning() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln() {
-	run_test_sweep_to_ln(false, false, false).await;
+	run_test_sweep_to_ln(SweepVariant::default()).await;
 }
 
 /// The same sweep with the event handler's hash-to-id map ignored, so the rebalancer's wait can
@@ -392,7 +392,8 @@ async fn test_sweep_to_ln() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_through_payment_store_search() {
-	run_test_sweep_to_ln(true, false, false).await;
+	run_test_sweep_to_ln(SweepVariant { forget_inbound_payment_ids: true, ..Default::default() })
+		.await;
 }
 
 /// The same sweep with a trusted wallet that reports no outcome for its payment after our node
@@ -403,33 +404,62 @@ async fn test_sweep_to_ln_through_payment_store_search() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_without_a_trusted_outcome() {
-	run_test_sweep_to_ln(false, true, false).await;
+	run_test_sweep_to_ln(SweepVariant { withhold_trusted_outcome: true, ..Default::default() })
+		.await;
 }
 
-/// The sweep of `test_sweep_to_ln_without_a_trusted_outcome`, listing transactions while only
-/// the first of the two transfer records is written. That is the Lightning one, so the transfer
-/// is known as trusted-to-Lightning while its trusted send is still unlisted.
+/// The sweep of `test_sweep_to_ln_without_a_trusted_outcome`, listing transactions while the
+/// rebalance is being recorded (stopped where its transfer records are written), with its trusted
+/// send unlisted.
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_listing_between_transfer_records() {
-	run_test_sweep_to_ln(false, true, true).await;
+	run_test_sweep_to_ln(SweepVariant {
+		withhold_trusted_outcome: true,
+		list_between_transfer_records: true,
+		..Default::default()
+	})
+	.await;
 }
 
-async fn run_test_sweep_to_ln(
-	forget_inbound_payment_ids: bool, withhold_trusted_outcome: bool,
+/// The sweep with a listing that overlaps the recording of the rebalance: it lists the payments
+/// before the rebalance is received and reads the transaction metadata only once the rebalance's
+/// transfer records are being written. Its trusted send is listed (as Spark lists it), still
+/// marked as a pending rebalance in the listing's view, and the Lightning receipt is missing from
+/// it, so only the metadata can place the transfer.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_sweep_to_ln_listing_across_transfer_records() {
+	run_test_sweep_to_ln(SweepVariant { list_across_transfer_records: true, ..Default::default() })
+		.await;
+}
+
+/// What to vary in [`run_test_sweep_to_ln`].
+#[derive(Clone, Copy, Default)]
+struct SweepVariant {
+	/// Find the received rebalance payment through the payment-store search only.
+	forget_inbound_payment_ids: bool,
+	/// The trusted wallet reports no outcome for, and does not list, its payments.
+	withhold_trusted_outcome: bool,
+	/// List transactions while the rebalance's transfer records are being written.
 	list_between_transfer_records: bool,
-) {
+	/// Start a listing before the rebalance is received and let it read the metadata only while
+	/// the rebalance's transfer records are being written.
+	list_across_transfer_records: bool,
+}
+
+async fn run_test_sweep_to_ln(variant: SweepVariant) {
 	test_utils::run_test(move |params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let lsp = Arc::clone(&params.lsp);
 		let third_party = Arc::clone(&params.third_party);
-		if forget_inbound_payment_ids {
+		if variant.forget_inbound_payment_ids {
 			wallet.forget_inbound_payment_ids_for_tests();
 		}
-		if withhold_trusted_outcome {
+		if variant.withhold_trusted_outcome {
 			wallet.withhold_trusted_payment_outcomes_for_tests();
 		}
-		if list_between_transfer_records {
+		if variant.list_between_transfer_records || variant.list_across_transfer_records {
 			wallet.arm_transfer_record_pause_for_tests();
 		}
 
@@ -487,6 +517,20 @@ async fn run_test_sweep_to_ln(
 			"Expected RebalanceInitiated event but got {event:?}"
 		);
 
+		// The trusted wallet now lists both the triggering receive and the rebalance's send, while
+		// the Lightning receipt is still some way off (the LSP has a channel to open first).
+		let overlapping_listing = if variant.list_across_transfer_records {
+			wallet.arm_listing_pause_for_tests();
+			let w = Arc::clone(&wallet);
+			let listing = tokio::spawn(async move { w.list_transactions().await });
+			tokio::time::timeout(Duration::from_secs(20), wallet.listing_pause_reached_for_tests())
+				.await
+				.expect("the listing listed the payments");
+			Some(listing)
+		} else {
+			None
+		};
+
 		// wait for rebalance
 		test_utils::wait_for_condition("wait for new channel to be opened", || async {
 			starting_lsp_channels.len() < lsp.list_channels().len()
@@ -519,16 +563,35 @@ async fn run_test_sweep_to_ln(
 				e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 			};
 
-		if list_between_transfer_records {
+		if variant.list_between_transfer_records || variant.list_across_transfer_records {
 			tokio::time::timeout(
 				Duration::from_secs(20),
 				wallet.transfer_record_pause_reached_for_tests(),
 			)
 			.await
-			.expect("the rebalance reached the pause between its transfer records");
-			// Only the Lightning record exists and the trusted send is unlisted: the listing must
-			// still place the transfer (debug builds assert when they cannot).
+			.expect("the rebalance reached the pause where its transfer records are written");
+		}
+		if variant.list_between_transfer_records {
+			// The trusted send is unlisted: the listing must still place the transfer (debug
+			// builds assert when they cannot).
 			wallet.list_transactions().await.unwrap();
+		}
+		if let Some(listing) = overlapping_listing {
+			wallet.resume_listing_for_tests();
+			let txs = listing.await.expect("the overlapping listing panicked").unwrap();
+			// It listed the payments before the rebalance was received, so the transfer it shows
+			// lacks the Lightning receive fee: proof that the listing did overlap.
+			let transfer = txs
+				.iter()
+				.find(|t| !t.outbound && t.amount == Some(recv_amt))
+				.expect("the overlapping listing shows the transfer");
+			assert!(
+				transfer.fee.unwrap_or(Amount::ZERO)
+					< Amount::from_milli_sats(rebalance_lsp_fee_msats).unwrap(),
+				"the listing saw the rebalance's receipt: {transfer:?}"
+			);
+		}
+		if variant.list_between_transfer_records || variant.list_across_transfer_records {
 			wallet.resume_transfer_records_for_tests();
 		}
 
@@ -598,7 +661,7 @@ async fn run_test_sweep_to_ln(
 			second_tx.fee.is_some_and(|a| a > Amount::ZERO),
 			"Second transaction should have fee greater than 0"
 		);
-		if withhold_trusted_outcome {
+		if variant.withhold_trusted_outcome {
 			// The trusted wallet lists no send for the rebalance, so the transfer carries the
 			// Lightning receive fee only.
 			assert_eq!(

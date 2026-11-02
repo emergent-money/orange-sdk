@@ -128,7 +128,10 @@ struct WalletImpl {
 	runtime: Arc<Runtime>,
 	/// Test only: see [`Wallet::arm_transfer_record_pause_for_tests`].
 	#[cfg(feature = "_test-utils")]
-	transfer_record_pause: Arc<rebalancer::TransferRecordPause>,
+	transfer_record_pause: Arc<rebalancer::TestPause>,
+	/// Test only: see [`Wallet::arm_listing_pause_for_tests`].
+	#[cfg(feature = "_test-utils")]
+	listing_pause: Arc<rebalancer::TestPause>,
 }
 
 /// The primary entry point for orange-sdk providing a graduated custody Bitcoin wallet.
@@ -830,6 +833,8 @@ impl Wallet {
 			runtime,
 			#[cfg(feature = "_test-utils")]
 			transfer_record_pause,
+			#[cfg(feature = "_test-utils")]
+			listing_pause: Arc::default(),
 		});
 
 		Ok(Wallet { inner })
@@ -869,6 +874,8 @@ impl Wallet {
 		let trusted_payments = trusted_payments?;
 		let mut lightning_payments = self.inner.ln_wallet.list_payments()?;
 		lightning_payments.sort_by_key(|l| l.latest_update_timestamp);
+		#[cfg(feature = "_test-utils")]
+		self.inner.listing_pause.pause_if_armed().await;
 
 		let mut res = Vec::with_capacity(
 			trusted_payments.len() + lightning_payments.len() + splice_outs.len(),
@@ -1369,9 +1376,9 @@ impl Wallet {
 		self.inner.rebalancer.set_trusted_failure_receipt_grace(grace);
 	}
 
-	/// Test only: makes the next rebalance recorded as successful stop after writing the first of
-	/// its two transfer records (the Lightning one), until
-	/// [`Self::resume_transfer_records_for_tests`].
+	/// Test only: makes the next rebalance recorded as successful stop right after its transfer is
+	/// recorded (the trigger's promotion and both transfer records, all at once), before the
+	/// `RebalanceSuccessful` event, until [`Self::resume_transfer_records_for_tests`].
 	#[cfg(feature = "_test-utils")]
 	#[doc(hidden)]
 	pub fn arm_transfer_record_pause_for_tests(&self) {
@@ -1391,6 +1398,30 @@ impl Wallet {
 	#[doc(hidden)]
 	pub fn resume_transfer_records_for_tests(&self) {
 		self.inner.transfer_record_pause.resume();
+	}
+
+	/// Test only: makes the next [`Self::list_transactions`] stop after listing the payments of
+	/// both wallets and before reading the transaction metadata, until
+	/// [`Self::resume_listing_for_tests`].
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn arm_listing_pause_for_tests(&self) {
+		self.inner.listing_pause.arm();
+	}
+
+	/// Test only: resolves once the pause armed by [`Self::arm_listing_pause_for_tests`] has been
+	/// reached.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub async fn listing_pause_reached_for_tests(&self) {
+		self.inner.listing_pause.reached().await;
+	}
+
+	/// Test only: ends the pause armed by [`Self::arm_listing_pause_for_tests`].
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn resume_listing_for_tests(&self) {
+		self.inner.listing_pause.resume();
 	}
 
 	/// Test only: an invoice on this node as the rebalancer asks for one.

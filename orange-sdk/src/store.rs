@@ -511,30 +511,6 @@ impl TxMetadataStore {
 		debug_assert!(!had_old);
 	}
 
-	pub async fn set_tx_caused_rebalance(&self, payment_id: &PaymentId) -> Result<(), ()> {
-		let (key_str, ser) = {
-			let mut tx_metadata = self.tx_metadata.write().unwrap();
-			if let Some(metadata) = tx_metadata.get_mut(payment_id) {
-				if let TxType::Payment { ty } = &mut metadata.ty {
-					metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
-					let key_str = payment_id.to_string();
-					let ser = metadata.encode();
-					(key_str, ser)
-				} else {
-					eprintln!("payment_id {payment_id} is not a payment, cannot set rebalance");
-					return Err(());
-				}
-			} else {
-				eprintln!("doesn't exist in metadata store: {payment_id}");
-				return Err(());
-			}
-		};
-		KVStore::write(self.store.as_ref(), STORE_PRIMARY_KEY, STORE_SECONDARY_KEY, &key_str, ser)
-			.await
-			.expect("We do not allow writes to fail");
-		Ok(())
-	}
-
 	/// Atomically marks `trigger_id` as a rebalance trigger and writes `splice_metadata` for
 	/// `splice_id`. The in-memory updates happen under a single write lock so that a concurrent
 	/// `list_transactions` either sees both changes or neither — without this, the rebalancer
@@ -584,6 +560,66 @@ impl TxMetadataStore {
 		);
 		trigger_res.expect("We do not allow writes to fail");
 		splice_res.expect("We do not allow writes to fail");
+		Ok(())
+	}
+
+	/// Atomically records a trusted-to-Lightning transfer: marks `trigger_id` as the payment that
+	/// triggered it and writes `transfer_metadata` for both its Lightning payment (`lightning_id`,
+	/// which must not have metadata yet) and its trusted payment (`trusted_id`, replacing its
+	/// pending-rebalance placeholder).
+	///
+	/// As in [`Self::set_tx_caused_rebalance_with_splice`], the in-memory updates happen under a
+	/// single write lock, so a concurrent `list_transactions` sees all three or none. It lists the
+	/// payments of both wallets before it reads this metadata, so with the writes one at a time it
+	/// could see a record without the payment it is keyed on (a Lightning receipt that arrived
+	/// after its payment listing, or a trusted send the trusted wallet does not list yet) and be
+	/// unable to place the transfer, which debug builds assert on. This also closes the window
+	/// between the trigger's promotion and the transfer records (#1281) for in-memory readers.
+	///
+	/// The three keys are persisted in that order (trigger, Lightning, trusted); a crash between
+	/// them can still leave a partial state on disk.
+	pub(crate) async fn set_tx_caused_rebalance_with_transfer(
+		&self, trigger_id: &PaymentId, lightning_id: PaymentId, trusted_id: PaymentId,
+		transfer_metadata: TxMetadata,
+	) -> Result<(), ()> {
+		let writes = {
+			let mut tx_metadata = self.tx_metadata.write().unwrap();
+			let trigger = match tx_metadata.get_mut(trigger_id) {
+				Some(metadata) => {
+					if let TxType::Payment { ty } = &mut metadata.ty {
+						metadata.ty = TxType::PaymentTriggeringTransferLightning { ty: *ty };
+						(trigger_id.to_string(), metadata.encode())
+					} else {
+						eprintln!("payment_id {trigger_id} is not a payment, cannot set rebalance");
+						return Err(());
+					}
+				},
+				None => {
+					eprintln!("doesn't exist in metadata store: {trigger_id}");
+					return Err(());
+				},
+			};
+			let had_lightning = tx_metadata.insert(lightning_id, transfer_metadata).is_some();
+			debug_assert!(!had_lightning);
+			tx_metadata.insert(trusted_id, transfer_metadata);
+			let encoded = transfer_metadata.encode();
+			[
+				trigger,
+				(lightning_id.to_string(), encoded.clone()),
+				(trusted_id.to_string(), encoded),
+			]
+		};
+		for (key, value) in writes {
+			KVStore::write(
+				self.store.as_ref(),
+				STORE_PRIMARY_KEY,
+				STORE_SECONDARY_KEY,
+				&key,
+				value,
+			)
+			.await
+			.expect("We do not allow writes to fail");
+		}
 		Ok(())
 	}
 
