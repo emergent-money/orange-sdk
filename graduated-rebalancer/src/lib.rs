@@ -39,7 +39,9 @@ fn duration_to_millis(duration: Duration) -> u64 {
 /// [`RebalanceTunables::trusted_failure_receipt_grace`], whether or not a receipt then lands and
 /// whether or not the trusted wallet ever reports an outcome (Cashu does not, for a failed melt).
 /// Once the receipt is in hand with no failure reported, at most another 10 min
-/// (`TRUSTED_VERDICT_WAIT`) for the trusted wallet's verdict.
+/// (`TRUSTED_VERDICT_WAIT`) for the trusted wallet's verdict. That includes a failure reported only
+/// at or after the receipt (the receipt wins the race): Cashu, which never gives a verdict for a
+/// failed melt, then holds the rebalancer the full 10 min.
 pub const RECEIPT_DEADLINE_GRACE: Duration = Duration::from_secs(7_200);
 
 /// With a rebalance's Lightning receipt in hand and no trusted failure reported, how long the
@@ -98,7 +100,9 @@ pub struct RebalanceTunables {
 	/// This avoids unnecessary transfers and fees.
 	pub rebalance_min: Amount,
 	/// How long the rebalancer still waits for the Lightning receipt of a rebalance payment after
-	/// the trusted wallet reported that payment failed.
+	/// the trusted wallet reported that payment failed. If the receipt arrives, the rest of the
+	/// grace also bounds the wait for the trusted wallet's verdict (its fee), so a wallet that
+	/// never gives one (Cashu, for a failed melt) holds the rebalancer no longer.
 	///
 	/// A trusted wallet can report a failure after our node already received the payment (Breez
 	/// reports a Spark send as failed when the operator gets no preimage back, which happens after
@@ -862,6 +866,18 @@ mod tests {
 			rebalance(Some(secs(1)), Some(secs(60)), Verdict::Never).await,
 			(secs(61), Some(1_000))
 		);
+	}
+
+	/// A failure reported less than a grace before the receipt deadline, then a receipt: the wait
+	/// for the trusted verdict ends at the deadline, not at the end of the grace.
+	#[tokio::test(start_paused = true)]
+	async fn the_verdict_wait_after_a_late_failure_ends_at_the_deadline() {
+		let secs = Duration::from_secs;
+		let deadline = INVOICE_EXPIRY + RECEIPT_DEADLINE_GRACE;
+		let (failure, receipt) = (deadline - secs(30), deadline - secs(10));
+		let (elapsed, fee) = rebalance(Some(failure), Some(receipt), Verdict::Never).await;
+		assert_eq!(fee, Some(1_000));
+		assert_ended_at_the_deadline(elapsed);
 	}
 
 	/// Without a trusted failure the receipt completes the rebalance, however long it takes, and

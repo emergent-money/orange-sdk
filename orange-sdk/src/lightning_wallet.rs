@@ -73,7 +73,9 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 86_400; // 24 hours
 /// the trusted wallet reports releases the rebalancer within seconds plus the trusted-failure
 /// receipt grace, also when the trusted wallet then never reports an outcome (Cashu, for a failed
 /// melt). Once the payment's receipt is in hand with no failure reported, the rebalancer waits at
-/// most another 10 minutes for the trusted wallet's verdict, which only supplies its fee.
+/// most another 10 minutes for the trusted wallet's verdict, which only supplies its fee; that
+/// includes a failure reported only at or after the receipt, for which Cashu, never giving a
+/// verdict for a failed melt, then holds the rebalancer the full 10 minutes.
 const REBALANCE_INVOICE_EXPIRY_SECS: u32 = 86_400;
 
 impl LightningWallet {
