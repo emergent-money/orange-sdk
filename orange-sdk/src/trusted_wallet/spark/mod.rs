@@ -268,7 +268,11 @@ impl TrustedWalletInterface for Spark {
 						.await
 					{
 						Ok(res) => {
-							log_info!(logger, "Payment sent successfully: {res:?}");
+							log_info!(
+								logger,
+								"Payment sent successfully: {}",
+								payment_summary(&res.payment)
+							);
 						},
 						Err(e) => {
 							log_error!(logger, "Failed to send payment: {e:?}");
@@ -522,7 +526,8 @@ impl EventListener for SparkEventHandler {
 			SdkEvent::PaymentPending { payment } => {
 				log_debug!(
 					self.logger,
-					"Spark payment pending event received for payment: {payment:?}"
+					"Spark payment pending event received for payment: {}",
+					payment_summary(&payment)
 				);
 			},
 			SdkEvent::AutoOptimization { optimization_event } => {
@@ -545,7 +550,7 @@ impl SparkEventHandler {
 	async fn handle_payment_succeeded(
 		&self, payment: breez_sdk_spark::Payment,
 	) -> Result<(), TrustedError> {
-		log_info!(self.logger, "Spark payment succeeded: {payment:?}");
+		log_info!(self.logger, "Spark payment succeeded: {}", payment_summary(&payment));
 
 		let id = parse_payment_id(&payment.id)?;
 
@@ -602,7 +607,11 @@ impl SparkEventHandler {
 						self.payment_success_sender.send(()).unwrap();
 					},
 					_ => {
-						log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
+						log_debug!(
+							self.logger,
+							"Unsupported payment details for Send: {}",
+							payment_summary(&payment)
+						)
 					},
 				}
 			},
@@ -633,7 +642,8 @@ impl SparkEventHandler {
 					_ => {
 						log_debug!(
 							self.logger,
-							"Unsupported payment details for Receive: {payment:?}"
+							"Unsupported payment details for Receive: {}",
+							payment_summary(&payment)
 						)
 					},
 				}
@@ -646,7 +656,7 @@ impl SparkEventHandler {
 	async fn handle_payment_failed(
 		&self, payment: breez_sdk_spark::Payment,
 	) -> Result<(), TrustedError> {
-		log_info!(self.logger, "Spark payment failed: {payment:?}");
+		log_info!(self.logger, "Spark payment failed: {}", payment_summary(&payment));
 
 		let id = parse_payment_id(&payment.id)?;
 
@@ -681,11 +691,19 @@ impl SparkEventHandler {
 						.await?;
 				},
 				_ => {
-					log_debug!(self.logger, "Unsupported payment details for Send: {payment:?}")
+					log_debug!(
+						self.logger,
+						"Unsupported payment details for Send: {}",
+						payment_summary(&payment)
+					)
 				},
 			},
 			PaymentType::Receive => {
-				log_debug!(self.logger, "Receive payments cannot fail: {payment:?}");
+				log_debug!(
+					self.logger,
+					"Receive payments cannot fail: {}",
+					payment_summary(&payment)
+				);
 			},
 		}
 
@@ -713,6 +731,20 @@ fn check_invoice_payment_hash(
 			invoice.payment_hash()
 		)))
 	}
+}
+
+/// What to log about a Breez payment, instead of its `Debug`: a Lightning payment's details carry
+/// its preimage. (Breez a99d0ec redacts it in `SparkHtlcDetails`'s `Debug`, but we do not rely on
+/// that.)
+fn payment_summary(payment: &breez_sdk_spark::Payment) -> String {
+	let payment_hash = match &payment.details {
+		Some(PaymentDetails::Lightning { htlc_details, .. }) => htlc_details.payment_hash.as_str(),
+		_ => "-",
+	};
+	format!(
+		"id={} type={:?} status={:?} amount={} fees={} payment_hash={payment_hash}",
+		payment.id, payment.payment_type, payment.status, payment.amount, payment.fees
+	)
 }
 
 /// Whether `payment` is an outgoing Lightning payment, in any state, for `payment_hash`.
@@ -895,6 +927,20 @@ mod tests {
 
 	/// The condition `await_payment_failure` (and, after a receipt, `await_payment_success`)
 	/// acts on: only a definite failure of our send counts.
+	/// The log summary of a payment never includes its preimage.
+	#[test]
+	fn payment_summary_omits_the_preimage() {
+		let mut payment =
+			lightning_payment(PaymentType::Send, PaymentStatus::Completed, [0x66; 32]);
+		let preimage = "77".repeat(32);
+		if let Some(PaymentDetails::Lightning { htlc_details, .. }) = &mut payment.details {
+			htlc_details.preimage = Some(preimage.clone());
+		}
+		let summary = payment_summary(&payment);
+		assert!(summary.contains(&"66".repeat(32)), "{summary}");
+		assert!(!summary.contains(&preimage));
+	}
+
 	#[test]
 	fn spark_send_failure_condition() {
 		let hash = [0x44; 32];

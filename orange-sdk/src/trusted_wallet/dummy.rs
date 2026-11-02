@@ -219,7 +219,13 @@ impl DummyTrustedWallet {
 					Event::SpliceNegotiated { .. } => {},
 					Event::SpliceNegotiationFailed { .. } => {},
 				}
-				println!("dummy: {event:?}");
+				match &event {
+					// Its `Debug` would include the payment preimage.
+					Event::PaymentSuccessful { payment_id, payment_hash, .. } => {
+						println!("dummy: PaymentSuccessful {payment_id} {payment_hash}")
+					},
+					_ => println!("dummy: {event:?}"),
+				}
 				if let Err(e) = events_ref.event_handled() {
 					eprintln!("Error handling dummy ldk event: {e}");
 				}

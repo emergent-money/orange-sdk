@@ -741,10 +741,10 @@ impl Cashu {
 								Some(str) => match FromHex::from_hex(str) {
 									Ok(b) => Some(PaymentPreimage(b)),
 									Err(e) => {
+										// Not the proof itself: it is the preimage.
 										log_error!(
 											logger,
-											"Failed to decode preimage ({:?}) for quote {quote_id}: {e}",
-											res.payment_proof()
+											"Failed to decode the payment proof for quote {quote_id}: {e}"
 										);
 										None
 									},

@@ -260,7 +260,16 @@ impl LightningWallet {
 		runtime.spawn_cancellable_background_task(async move {
 			loop {
 				let event = ev_handler.ldk_node.next_event_async().await;
-				log_debug!(ev_handler.logger, "Got ldk-node event {event:?}");
+								match &event {
+					// Its `Debug` would include the payment preimage.
+					ldk_node::Event::PaymentSuccessful {
+						payment_id, payment_hash, fee_paid_msat, ..
+					} => log_debug!(
+						ev_handler.logger,
+						"Got ldk-node event PaymentSuccessful {{ payment_id: {payment_id}, payment_hash: {payment_hash}, fee_paid_msat: {fee_paid_msat:?} }}"
+					),
+					_ => log_debug!(ev_handler.logger, "Got ldk-node event {event:?}"),
+				}
 				ev_handler.handle_ldk_node_event(event).await;
 			}
 		});
