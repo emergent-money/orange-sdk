@@ -460,7 +460,9 @@ async fn test_sweep_to_ln() {
 
 		let expect_amt = intermediate_amt.saturating_add(recv_amt);
 
-		let received_rebalance_amount = match wait_next_event(&wallet).await {
+		let (received_rebalance_amount, received_rebalance_id) = match wait_next_event(&wallet)
+			.await
+		{
 			Event::PaymentReceived { payment_id, amount_msat, lsp_fee_msats, .. } => {
 				assert!(matches!(payment_id, orange_sdk::PaymentId::SelfCustodial(_)));
 				let lsp_fee_msats = lsp_fee_msats.expect("rebalance receive should pay LSP fee");
@@ -468,16 +470,24 @@ async fn test_sweep_to_ln() {
 					amount_msat + lsp_fee_msats <= expect_amt.milli_sats(),
 					"rebalance receive should not exceed trusted balance after fees"
 				);
-				amount_msat + lsp_fee_msats
+				(amount_msat + lsp_fee_msats, payment_id)
 			},
 			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 		};
 
 		let event = wait_next_event(&wallet).await;
 		match event {
-			Event::RebalanceSuccessful { amount_msat, fee_msat, .. } => {
+			Event::RebalanceSuccessful {
+				amount_msat, fee_msat, ln_rebalance_payment_id, ..
+			} => {
 				assert!(fee_msat > 0);
 				assert_eq!(amount_msat, received_rebalance_amount);
+				// The rebalance is recorded under the id the received payment is stored under
+				// (derived from its HTLCs since ldk-node #948), not under its payment hash.
+				assert_eq!(
+					orange_sdk::PaymentId::SelfCustodial(ln_rebalance_payment_id),
+					received_rebalance_id
+				);
 			},
 			e => panic!("Expected RebalanceSuccessful event, got {e:?}"),
 		}

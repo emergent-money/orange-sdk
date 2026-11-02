@@ -486,6 +486,98 @@ mod tests {
 			})
 		);
 	}
+
+	/// An event handler around an ldk-node that is never started (so no bitcoind is needed) and a
+	/// dummy trusted wallet that holds no payments. Keep the returned sender alive.
+	#[cfg(feature = "_test-utils")]
+	async fn claimable_test_handler() -> (PathBuf, LdkEventHandler, TrustedWalletSender) {
+		use crate::lightning_wallet::{InboundPaymentIds, SplicePendingInbox};
+		use crate::trusted_wallet::dummy::DummyTrustedWallet;
+		use std::sync::Mutex as StdMutex;
+		use tokio::sync::Notify;
+
+		let (path, store) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
+		let event_queue =
+			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
+
+		let mut builder = ldk_node::Builder::new();
+		builder.set_network(ldk_node::bitcoin::Network::Regtest);
+		builder.set_storage_dir_path(path.join("ldk").to_str().unwrap().to_string());
+		let node_entropy = ldk_node::entropy::NodeEntropy::from_seed_bytes([7; 64]);
+		let ldk_node = Arc::new(builder.build(node_entropy).expect("build ldk-node"));
+
+		let trusted: Box<DynTrustedWalletInterface> =
+			Box::new(DummyTrustedWallet::unstarted(Arc::clone(&ldk_node)));
+		let (trusted_sender, trusted_handle) = watch::channel(Some(Arc::new(trusted)));
+
+		let handler = LdkEventHandler {
+			event_queue,
+			ldk_node,
+			tx_metadata,
+			store,
+			trusted: trusted_handle,
+			payment_receipt_sender: watch::channel(()).0,
+			channel_pending_sender: watch::channel(0).0,
+			splice_pending_inbox: Arc::new(SplicePendingInbox {
+				pending: StdMutex::new(HashMap::new()),
+				notify: Notify::new(),
+			}),
+			inbound_payment_ids: Arc::new(InboundPaymentIds::default()),
+			logger,
+		};
+		(path, handler, trusted_sender)
+	}
+
+	#[cfg(feature = "_test-utils")]
+	type TrustedWalletSender = watch::Sender<Option<Arc<Box<DynTrustedWalletInterface>>>>;
+
+	/// `claim_for_id` no longer checks the amount (ldk-node #1170), so the check against the
+	/// wrapped receive's requested amount is the only thing standing between an underpaid HTLC
+	/// and a claim that releases the preimage.
+	#[cfg(feature = "_test-utils")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn underpaid_wrapped_receive_is_failed_back_and_kept() {
+		let (_path, handler, _trusted_sender) = claimable_test_handler().await;
+		let payment_hash = PaymentHash([0x5a; 32]);
+		// Test data only. The decision does not check it against the hash.
+		let preimage = [0x42; 32];
+		let entry = store::WrappedReceiveEntry {
+			preimage,
+			created_at_secs: 1_700_000_000,
+			amount_msat: 21_000,
+		};
+		store::write_wrapped_receive(&*handler.store, &payment_hash, &entry).await.unwrap();
+
+		for underpaid in [0, 1, 20_999] {
+			assert!(matches!(
+				handler.decide_payment_claimable(payment_hash, underpaid).await,
+				ClaimableDecision::FailBack
+			));
+		}
+		// The entry stays, so a payment of the full amount can still be claimed.
+		assert!(
+			store::read_wrapped_receive(&*handler.store, &payment_hash).await.unwrap().is_some()
+		);
+
+		for paid in [21_000, 21_001, u64::MAX] {
+			assert!(matches!(
+				handler.decide_payment_claimable(payment_hash, paid).await,
+				ClaimableDecision::Claim(p) if p == PaymentPreimage(preimage)
+			));
+		}
+	}
+
+	#[cfg(feature = "_test-utils")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn claimable_payment_without_a_wrapped_receive_is_failed_back() {
+		let (_path, handler, _trusted_sender) = claimable_test_handler().await;
+		assert!(matches!(
+			handler.decide_payment_claimable(PaymentHash([0x6b; 32]), u64::MAX).await,
+			ClaimableDecision::FailBack
+		));
+	}
 }
 
 struct EventQueueSerWrapper<'a>(&'a VecDeque<Event>);
@@ -520,6 +612,16 @@ impl Future for EventFuture {
 			Poll::Pending
 		}
 	}
+}
+
+/// What [`LdkEventHandler`] does with a payment waiting to be claimed (`PaymentClaimable`).
+///
+/// Deliberately not `Debug`: `Claim` holds a preimage, which must never be printed.
+enum ClaimableDecision {
+	/// Claim the payment with this preimage.
+	Claim(PaymentPreimage),
+	/// Fail the payment back.
+	FailBack,
 }
 
 /// The trusted wallet as seen by [`LdkEventHandler`], which starts before the trusted wallet has
@@ -748,6 +850,25 @@ impl LdkEventHandler {
 	async fn handle_payment_claimable(
 		&self, payment_id: LdkPaymentId, payment_hash: PaymentHash, claimable_amount_msat: u64,
 	) {
+		match self.decide_payment_claimable(payment_hash, claimable_amount_msat).await {
+			ClaimableDecision::Claim(preimage) => {
+				// `claim_for_id` checks only that the preimage matches the payment's hash, not the
+				// amount: the check in `decide_payment_claimable` is the only one.
+				if let Err(e) = self.ldk_node.bolt11_payment().claim_for_id(payment_id, preimage) {
+					log_error!(self.logger, "Failed to claim wrapped receive {payment_hash}: {e}");
+					self.fail_claimable_payment(payment_id, payment_hash);
+				}
+			},
+			ClaimableDecision::FailBack => self.fail_claimable_payment(payment_id, payment_hash),
+		}
+	}
+
+	/// Decides whether to claim a payment of `claimable_amount_msat` to `payment_hash`, as
+	/// described on [`Self::handle_payment_claimable`], logging why one is failed back. Retires
+	/// the wrapped receive if its trusted leg was already paid.
+	async fn decide_payment_claimable(
+		&self, payment_hash: PaymentHash, claimable_amount_msat: u64,
+	) -> ClaimableDecision {
 		let entry = match store::read_wrapped_receive(&*self.store, &payment_hash).await {
 			Ok(Some(entry)) => entry,
 			Ok(None) => {
@@ -755,16 +876,14 @@ impl LdkEventHandler {
 					self.logger,
 					"Failing back claimable payment {payment_hash}: not a pending wrapped receive"
 				);
-				self.fail_claimable_payment(payment_id, payment_hash);
-				return;
+				return ClaimableDecision::FailBack;
 			},
 			Err(e) => {
 				log_error!(
 					self.logger,
 					"Failing back claimable payment {payment_hash}: failed to read wrapped receive: {e}"
 				);
-				self.fail_claimable_payment(payment_id, payment_hash);
-				return;
+				return ClaimableDecision::FailBack;
 			},
 		};
 
@@ -774,8 +893,7 @@ impl LdkEventHandler {
 				"Failing back wrapped receive {payment_hash}: claimable {claimable_amount_msat} msat is below the requested {} msat",
 				entry.amount_msat
 			);
-			self.fail_claimable_payment(payment_id, payment_hash);
-			return;
+			return ClaimableDecision::FailBack;
 		}
 
 		match self.trusted_leg_paid(payment_hash).await {
@@ -788,26 +906,18 @@ impl LdkEventHandler {
 				if let Err(e) = store::remove_wrapped_receive(&*self.store, &payment_hash).await {
 					log_error!(self.logger, "Failed to remove wrapped receive {payment_hash}: {e}");
 				}
-				self.fail_claimable_payment(payment_id, payment_hash);
-				return;
+				return ClaimableDecision::FailBack;
 			},
 			Err(e) => {
 				log_error!(
 					self.logger,
 					"Failing back wrapped receive {payment_hash}: failed to check its trusted leg: {e}"
 				);
-				self.fail_claimable_payment(payment_id, payment_hash);
-				return;
+				return ClaimableDecision::FailBack;
 			},
 		}
 
-		let preimage = PaymentPreimage(entry.preimage);
-		// `claim_for_id` checks only that the preimage matches the payment's hash, not the amount:
-		// the amount check above is the only one.
-		if let Err(e) = self.ldk_node.bolt11_payment().claim_for_id(payment_id, preimage) {
-			log_error!(self.logger, "Failed to claim wrapped receive {payment_hash}: {e}");
-			self.fail_claimable_payment(payment_id, payment_hash);
-		}
+		ClaimableDecision::Claim(PaymentPreimage(entry.preimage))
 	}
 
 	/// Whether the trusted wallet already holds a payment for the trusted leg of a wrapped receive,

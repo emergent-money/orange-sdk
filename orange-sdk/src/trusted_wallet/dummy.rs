@@ -331,6 +331,19 @@ impl DummyTrustedWallet {
 		DummyTrustedWallet { current_bal_msats, payments, ldk_node, payment_success_flag }
 	}
 
+	/// A dummy wallet around an ldk-node that is never started, for unit tests that make no
+	/// payments.
+	#[cfg(test)]
+	pub(crate) fn unstarted(ldk_node: Arc<Node>) -> Self {
+		let (_payment_success_sender, payment_success_flag) = watch::channel(());
+		DummyTrustedWallet {
+			current_bal_msats: Arc::new(AtomicU64::new(0)),
+			payments: Arc::new(RwLock::new(Vec::new())),
+			ldk_node,
+			payment_success_flag,
+		}
+	}
+
 	fn payment_wait_timeout() -> Duration {
 		if std::env::var("CI").is_ok() { Duration::from_secs(120) } else { Duration::from_secs(20) }
 	}
