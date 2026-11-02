@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn duration_to_millis(duration: Duration) -> u64 {
 	u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -41,6 +41,16 @@ fn receipt_deadline(invoice: &Bolt11Invoice) -> Duration {
 	invoice
 		.expires_at()
 		.map_or(Duration::MAX, |expiry| expiry.saturating_add(RECEIPT_DEADLINE_GRACE))
+}
+
+/// The tokio [`Instant`](tokio::time::Instant) at `deadline`, a time since the Unix epoch. One
+/// beyond what an `Instant` can hold is as good as a century away.
+fn instant_at(deadline: Duration) -> tokio::time::Instant {
+	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+	let remaining = deadline.saturating_sub(now);
+	let now = tokio::time::Instant::now();
+	now.checked_add(remaining)
+		.unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 60 * 60))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,8 +324,9 @@ where
 		}
 	}
 
-	/// Changes [`RebalanceTunables::trusted_failure_receipt_grace`] for rebalances that start
-	/// from now on.
+	/// Changes [`RebalanceTunables::trusted_failure_receipt_grace`]. The grace is read when a
+	/// trusted failure is reported, so this also applies to a rebalance already waiting for its
+	/// receipt.
 	pub fn set_trusted_failure_receipt_grace(&self, grace: Duration) {
 		self.trusted_failure_receipt_grace_ms.store(duration_to_millis(grace), Ordering::Relaxed);
 	}
@@ -383,6 +394,7 @@ where
 			);
 			let expected_hash = inv.payment_hash();
 			let receipt_deadline = receipt_deadline(&inv);
+			let deadline = instant_at(receipt_deadline);
 			match self.trusted.pay(PaymentMethod::LightningBolt11(inv), transfer_amt).await {
 				Ok(rebalance_id) => {
 					log_debug!(
@@ -445,14 +457,36 @@ where
 						},
 					};
 
-					let trusted_payment =
-						match self.trusted.await_payment_success(expected_hash.0).await {
-							Some(success) => success,
-							None => {
-								log_error!(self.logger, "Failed to send rebalance payment!");
-								return;
-							},
-						};
+					// The receipt is in hand: our node was paid, so the rebalance is complete
+					// whatever the trusted side says now, and its verdict only supplies the
+					// trusted fee. That verdict can be wrong or never come: Breez can list a
+					// Spark send as failed after our node released the preimage (and never turns
+					// a failed payment into a completed one), and a Cashu wallet waits for an
+					// outgoing transaction that a failed melt never creates. So the wait is
+					// bounded by the receipt's deadline, and without a verdict the rebalance is
+					// recorded with the trusted fee unknown.
+					let trusted_fee_msat = match tokio::time::timeout_at(
+						deadline,
+						self.trusted.await_payment_success(expected_hash.0),
+					)
+					.await
+					{
+						Ok(Some(success)) => success.fee_paid_msat,
+						Ok(None) => {
+							log_warn!(
+								self.logger,
+								"Rebalance payment was received by our node, but the trusted side reports it failed or unknown; recording the rebalance with the trusted fee unknown"
+							);
+							None
+						},
+						Err(_) => {
+							log_warn!(
+								self.logger,
+								"Rebalance payment was received by our node, but the trusted side reported no outcome by the deadline; recording the rebalance with the trusted fee unknown"
+							);
+							None
+						},
+					};
 
 					log_info!(
 						self.logger,
@@ -468,7 +502,7 @@ where
 							ln_rebalance_payment_id: ln_payment.id,
 							amount_msat: transfer_amt.milli_sats(),
 							fee_msat: ln_payment.fee_paid_msat.unwrap_or_default()
-								+ trusted_payment.fee_paid_msat.unwrap_or_default(),
+								+ trusted_fee_msat.unwrap_or_default(),
 						})
 						.await;
 				},
@@ -543,7 +577,7 @@ mod tests {
 	use lightning::types::payment::{PaymentHash, PaymentSecret};
 	use lightning_invoice::{Currency, InvoiceBuilder};
 
-	pub(crate) fn invoice(expiry: Duration) -> Bolt11Invoice {
+	fn invoice_at(timestamp: Duration, expiry: Duration) -> Bolt11Invoice {
 		let secp = Secp256k1::new();
 		let key = SecretKey::from_slice(&[42; 32]).unwrap();
 		InvoiceBuilder::new(Currency::Regtest)
@@ -551,11 +585,19 @@ mod tests {
 			.amount_milli_satoshis(1_000_000)
 			.payment_hash(PaymentHash(sha256::Hash::hash(&[1; 32]).to_byte_array()))
 			.payment_secret(PaymentSecret([0; 32]))
-			.duration_since_epoch(Duration::from_secs(1_700_000_000))
+			.duration_since_epoch(timestamp)
 			.expiry_time(expiry)
 			.min_final_cltv_expiry_delta(144)
 			.build_signed(|msg| secp.sign_ecdsa_recoverable(msg, &key))
 			.unwrap()
+	}
+
+	fn invoice(expiry: Duration) -> Bolt11Invoice {
+		invoice_at(Duration::from_secs(1_700_000_000), expiry)
+	}
+
+	fn invoice_from_now(expiry: Duration) -> Bolt11Invoice {
+		invoice_at(SystemTime::now().duration_since(UNIX_EPOCH).unwrap(), expiry)
 	}
 
 	struct NoLogger;
@@ -563,9 +605,22 @@ mod tests {
 		fn log(&self, _record: lightning::util::logger::Record) {}
 	}
 
-	/// A trusted wallet whose rebalance payment reports failure after `fail_after`, if set.
+	/// What a mock trusted wallet's `await_payment_success` says about the rebalance payment.
+	#[derive(Clone, Copy)]
+	enum Verdict {
+		/// It succeeded, with a 500 msat fee.
+		Succeeded,
+		/// It failed (as Spark lists a send whose operator got no preimage back).
+		Failed,
+		/// Nothing, ever (as Cashu waiting for the transaction of a melt that failed).
+		Never,
+	}
+
+	/// A trusted wallet whose rebalance payment reports failure after `fail_after`, if set, and
+	/// whose `await_payment_success` gives `verdict`.
 	struct MockTrusted {
 		fail_after: Option<Duration>,
+		verdict: Verdict,
 	}
 
 	impl TrustedWallet for MockTrusted {
@@ -591,7 +646,16 @@ mod tests {
 		fn await_payment_success(
 			&self, _payment_hash: [u8; 32],
 		) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
-			Box::pin(async { Some(ReceivedLightningPayment { id: [1; 32], fee_paid_msat: None }) })
+			let verdict = self.verdict;
+			Box::pin(async move {
+				match verdict {
+					Verdict::Succeeded => {
+						Some(ReceivedLightningPayment { id: [1; 32], fee_paid_msat: Some(500) })
+					},
+					Verdict::Failed => None,
+					Verdict::Never => std::future::pending().await,
+				}
+			})
 		}
 		fn await_payment_failure(
 			&self, _payment_hash: [u8; 32],
@@ -619,7 +683,7 @@ mod tests {
 		fn get_bolt11_invoice(
 			&self, _amount: Option<Amount>,
 		) -> Pin<Box<dyn Future<Output = Result<Bolt11Invoice, ()>> + Send + '_>> {
-			Box::pin(async { Ok(invoice(Duration::from_secs(3_600))) })
+			Box::pin(async { Ok(invoice_from_now(INVOICE_EXPIRY)) })
 		}
 		fn pay(
 			&self, _method: PaymentMethod, _amount: Amount,
@@ -634,7 +698,7 @@ mod tests {
 				match receipt_after {
 					Some(after) => {
 						tokio::time::sleep(after).await;
-						Some(ReceivedLightningPayment { id: [2; 32], fee_paid_msat: None })
+						Some(ReceivedLightningPayment { id: [2; 32], fee_paid_msat: Some(1_000) })
 					},
 					None => std::future::pending().await,
 				}
@@ -686,13 +750,17 @@ mod tests {
 		}
 	}
 
-	/// Runs one trusted rebalance; returns how long it took and whether it succeeded.
+	/// The expiry of the mock Lightning wallet's invoices, which are dated now.
+	const INVOICE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+
+	/// Runs one trusted rebalance; returns how long it took and, if it was recorded as
+	/// successful, the total fee it was recorded with.
 	async fn rebalance(
-		fail_after: Option<Duration>, receipt_after: Option<Duration>,
-	) -> (Duration, bool) {
+		fail_after: Option<Duration>, receipt_after: Option<Duration>, verdict: Verdict,
+	) -> (Duration, Option<u64>) {
 		let events = Arc::new(Events::default());
 		let rebalancer = GraduatedRebalancer::new(
-			Arc::new(MockTrusted { fail_after }),
+			Arc::new(MockTrusted { fail_after, verdict }),
 			Arc::new(MockLightning { receipt_after }),
 			Arc::new(AlwaysTrusted),
 			Arc::clone(&events),
@@ -703,33 +771,76 @@ mod tests {
 		rebalancer.do_trusted_rebalance_if_needed().await;
 		let events = events.0.lock().unwrap();
 		assert!(matches!(events.first(), Some(RebalancerEvent::RebalanceInitiated { .. })));
-		let succeeded = matches!(events.get(1), Some(RebalancerEvent::RebalanceSuccessful { .. }));
-		assert_eq!(events.len(), if succeeded { 2 } else { 1 });
-		(start.elapsed(), succeeded)
+		let fee = match events.get(1) {
+			Some(RebalancerEvent::RebalanceSuccessful {
+				trusted_rebalance_payment_id,
+				ln_rebalance_payment_id,
+				fee_msat,
+				..
+			}) => {
+				assert_eq!(*trusted_rebalance_payment_id, [1; 32]);
+				assert_eq!(*ln_rebalance_payment_id, [2; 32]);
+				Some(*fee_msat)
+			},
+			None => None,
+			Some(e) => panic!("unexpected {e:?}"),
+		};
+		assert_eq!(events.len(), if fee.is_some() { 2 } else { 1 });
+		(start.elapsed(), fee)
+	}
+
+	/// The receipt deadline for an invoice dated now: its expiry plus `RECEIPT_DEADLINE_GRACE`,
+	/// less the sub-second part of now that the invoice timestamp drops.
+	fn assert_ended_at_the_deadline(elapsed: Duration) {
+		let deadline = INVOICE_EXPIRY + RECEIPT_DEADLINE_GRACE;
+		assert!(
+			elapsed <= deadline && elapsed > deadline - Duration::from_secs(2),
+			"ended after {elapsed:?}, deadline {deadline:?}"
+		);
 	}
 
 	/// A trusted failure with no receipt ends the rebalance once the grace is over.
 	#[tokio::test(start_paused = true)]
 	async fn trusted_failure_ends_the_rebalance_after_the_grace() {
 		let secs = Duration::from_secs;
-		assert_eq!(rebalance(Some(secs(1)), None).await, (secs(61), false));
+		assert_eq!(rebalance(Some(secs(1)), None, Verdict::Failed).await, (secs(61), None));
 	}
 
-	/// A receipt within the grace after a trusted failure completes the rebalance as usual, so it
-	/// is recorded rather than shown as fresh income.
+	/// A receipt within the grace after a trusted failure completes the rebalance: it is
+	/// recorded, with the trusted fee unknown when the trusted side keeps saying the payment
+	/// failed (Spark: Breez never turns a failed send into a completed one), rather than shown as
+	/// fresh income. Past the grace it is too late.
 	#[tokio::test(start_paused = true)]
 	async fn a_receipt_within_the_grace_after_a_trusted_failure_completes_the_rebalance() {
 		let secs = Duration::from_secs;
-		assert_eq!(rebalance(Some(secs(1)), Some(secs(30))).await, (secs(30), true));
-		// Past the grace it is too late.
-		assert_eq!(rebalance(Some(secs(1)), Some(secs(62))).await, (secs(61), false));
+		let (failure, receipt) = (Some(secs(1)), Some(secs(30)));
+		assert_eq!(rebalance(failure, receipt, Verdict::Failed).await, (secs(30), Some(1_000)));
+		assert_eq!(rebalance(failure, receipt, Verdict::Succeeded).await, (secs(30), Some(1_500)));
+		assert_eq!(rebalance(failure, Some(secs(62)), Verdict::Failed).await, (secs(61), None));
 	}
 
-	/// Without a trusted failure the receipt completes the rebalance, however long it takes.
+	/// Cashu: the failed-melt signal fires, the receipt lands within the grace, and the trusted
+	/// side never reports an outcome (it waits for a transaction the failed melt never created).
+	/// The rebalance is recorded at the receipt deadline, with the trusted fee unknown.
+	#[tokio::test(start_paused = true)]
+	async fn a_receipt_after_a_failed_melt_is_recorded_at_the_deadline() {
+		let secs = Duration::from_secs;
+		let (elapsed, fee) = rebalance(Some(secs(1)), Some(secs(30)), Verdict::Never).await;
+		assert_eq!(fee, Some(1_000));
+		assert_ended_at_the_deadline(elapsed);
+	}
+
+	/// Without a trusted failure the receipt completes the rebalance, however long it takes, and
+	/// a trusted side that reports failure or nothing afterwards does not undo it.
 	#[tokio::test(start_paused = true)]
 	async fn a_receipt_without_a_trusted_failure_completes_the_rebalance() {
 		let secs = Duration::from_secs;
-		assert_eq!(rebalance(None, Some(secs(600))).await, (secs(600), true));
+		let receipt = Some(secs(600));
+		assert_eq!(rebalance(None, receipt, Verdict::Succeeded).await, (secs(600), Some(1_500)));
+		assert_eq!(rebalance(None, receipt, Verdict::Failed).await, (secs(600), Some(1_000)));
+		let (elapsed, fee) = rebalance(None, receipt, Verdict::Never).await;
+		assert_eq!(fee, Some(1_000));
+		assert_ended_at_the_deadline(elapsed);
 	}
 
 	/// The wait for a rebalance payment ends two hours after its invoice expires, when LDK stops

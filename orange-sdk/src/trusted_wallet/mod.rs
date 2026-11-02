@@ -207,6 +207,12 @@ pub trait TrustedWalletInterface: Send + Sync + private::Sealed {
 	#[cfg(feature = "_test-utils")]
 	fn fail_next_payments_for_tests(&self, _count: usize) {}
 
+	/// Test only: from now on, [`Self::await_payment_success`] reports no outcome (`None`), as
+	/// Spark does for a send it lists as failed after the payment was received. Only the dummy
+	/// trusted wallet implements it.
+	#[cfg(feature = "_test-utils")]
+	fn withhold_payment_outcomes_for_tests(&self) {}
+
 	/// Gets the lightning address for this wallet, if one is set.
 	fn get_lightning_address(
 		&self,

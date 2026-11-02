@@ -1349,6 +1349,15 @@ impl Wallet {
 		self.inner.rebalancer.set_trusted_failure_receipt_grace(grace);
 	}
 
+	/// Test only: from now on the trusted wallet reports no outcome for its payments, as Spark does
+	/// for a send it lists as failed after the payment was received. Only the dummy trusted wallet
+	/// implements it.
+	#[cfg(feature = "_test-utils")]
+	#[doc(hidden)]
+	pub fn withhold_trusted_payment_outcomes_for_tests(&self) {
+		self.inner.trusted.withhold_payment_outcomes_for_tests();
+	}
+
 	/// Test only: makes the trusted wallet's next `count` BOLT 11 payments fail on their way. Only
 	/// the dummy trusted wallet implements it.
 	#[cfg(feature = "_test-utils")]

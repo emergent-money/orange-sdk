@@ -20,7 +20,7 @@ use rand::RngCore;
 use std::env::temp_dir;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
@@ -32,6 +32,8 @@ use uuid::Uuid;
 pub(crate) struct DummyTrustedWallet {
 	/// How many of the next BOLT 11 payments to fail on purpose (`fail_next_payments_for_tests`).
 	fail_next_payments: Arc<AtomicUsize>,
+	/// Whether `await_payment_success` reports nothing (`withhold_payment_outcomes_for_tests`).
+	withhold_outcomes: Arc<AtomicBool>,
 	current_bal_msats: Arc<AtomicU64>,
 	payments: Arc<RwLock<Vec<Payment>>>,
 	ldk_node: Arc<Node>,
@@ -339,6 +341,7 @@ impl DummyTrustedWallet {
 
 		DummyTrustedWallet {
 			fail_next_payments: Arc::new(AtomicUsize::new(0)),
+			withhold_outcomes: Arc::new(AtomicBool::new(false)),
 			current_bal_msats,
 			payments,
 			ldk_node,
@@ -353,6 +356,7 @@ impl DummyTrustedWallet {
 		let (_payment_success_sender, payment_success_flag) = watch::channel(());
 		DummyTrustedWallet {
 			fail_next_payments: Arc::new(AtomicUsize::new(0)),
+			withhold_outcomes: Arc::new(AtomicBool::new(false)),
 			current_bal_msats: Arc::new(AtomicU64::new(0)),
 			payments: Arc::new(RwLock::new(Vec::new())),
 			ldk_node,
@@ -571,6 +575,9 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		&self, payment_hash: [u8; 32],
 	) -> Pin<Box<dyn Future<Output = Option<ReceivedLightningPayment>> + Send + '_>> {
 		Box::pin(async move {
+			if self.withhold_outcomes.load(Ordering::SeqCst) {
+				return None;
+			}
 			// This waits for our own outbound payment (`pay` sends BOLT 11 invoices with
 			// `send_using_amount`), which ldk-node still stores under `PaymentId(payment_hash)`.
 			// Only inbound payments moved to ids derived from their HTLCs.
@@ -642,6 +649,10 @@ impl TrustedWalletInterface for DummyTrustedWallet {
 		self.fail_next_payments.store(count, Ordering::SeqCst);
 	}
 
+	fn withhold_payment_outcomes_for_tests(&self) {
+		self.withhold_outcomes.store(true, Ordering::SeqCst);
+	}
+
 	fn get_lightning_address(
 		&self,
 	) -> Pin<Box<dyn Future<Output = Result<Option<String>, TrustedError>> + Send + '_>> {
@@ -699,6 +710,7 @@ mod tests {
 		let (_payment_success_sender, payment_success_flag) = watch::channel(());
 		let wallet = DummyTrustedWallet {
 			fail_next_payments: Arc::new(AtomicUsize::new(0)),
+			withhold_outcomes: Arc::new(AtomicBool::new(false)),
 			current_bal_msats: Arc::new(AtomicU64::new(0)),
 			payments: Arc::new(RwLock::new(Vec::new())),
 			ldk_node: Arc::new(builder.build(node_entropy).unwrap()),

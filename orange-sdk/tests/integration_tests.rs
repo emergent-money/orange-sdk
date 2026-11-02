@@ -384,7 +384,7 @@ async fn test_pay_mpp_trusted_and_lightning() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln() {
-	run_test_sweep_to_ln(false).await;
+	run_test_sweep_to_ln(false, false).await;
 }
 
 /// The same sweep with the event handler's hash-to-id map ignored, so the rebalancer's wait can
@@ -392,16 +392,29 @@ async fn test_sweep_to_ln() {
 #[tokio::test(flavor = "multi_thread")]
 #[test_log::test]
 async fn test_sweep_to_ln_through_payment_store_search() {
-	run_test_sweep_to_ln(true).await;
+	run_test_sweep_to_ln(true, false).await;
 }
 
-async fn run_test_sweep_to_ln(forget_inbound_payment_ids: bool) {
+/// The same sweep with a trusted wallet that reports no outcome for its payment after our node
+/// received it (as Spark for a send it lists as failed once the operator got no preimage back).
+/// The receipt makes the rebalance complete: it is recorded, with the trusted fee unknown, and
+/// history is the same as for any rebalance.
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
+async fn test_sweep_to_ln_without_a_trusted_outcome() {
+	run_test_sweep_to_ln(false, true).await;
+}
+
+async fn run_test_sweep_to_ln(forget_inbound_payment_ids: bool, withhold_trusted_outcome: bool) {
 	test_utils::run_test(move |params| async move {
 		let wallet = Arc::clone(&params.wallet);
 		let lsp = Arc::clone(&params.lsp);
 		let third_party = Arc::clone(&params.third_party);
 		if forget_inbound_payment_ids {
 			wallet.forget_inbound_payment_ids_for_tests();
+		}
+		if withhold_trusted_outcome {
+			wallet.withhold_trusted_payment_outcomes_for_tests();
 		}
 
 		let starting_bal = wallet.get_balance().await.unwrap();
