@@ -232,6 +232,11 @@ impl EventQueue {
 	/// not acknowledged yet. Loading it means an event emitted shortly before a shutdown, or one
 	/// the user never got to handle, is delivered on the next run instead of being dropped.
 	///
+	/// Delivery is at-least-once: an LDK event is persisted here before it is acknowledged to
+	/// ldk-node, so a crash between the two delivers it again after a restart, once from this
+	/// queue and once from ldk-node's own replay. Consumers must be idempotent, as ldk-node
+	/// already requires of its event handlers.
+	///
 	/// A missing key is a fresh wallet and starts empty. Any other read error, or a stored queue
 	/// that does not decode, fails the build: the wallet must not silently start without events
 	/// it owes the user.
