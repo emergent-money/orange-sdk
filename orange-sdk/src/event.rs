@@ -11,7 +11,7 @@ use ldk_node::lightning::ln::channelmanager::PaymentId as LdkPaymentId;
 use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::lightning::util::logger::Logger as _;
 use ldk_node::lightning::util::persist::KVStore;
-use ldk_node::lightning::util::ser::{Writeable, Writer};
+use ldk_node::lightning::util::ser::{Readable, Writeable, Writer};
 use ldk_node::lightning::{
 	impl_writeable_tlv_based_enum, log_debug, log_error, log_info, log_warn,
 };
@@ -225,14 +225,64 @@ pub struct EventQueue {
 }
 
 impl EventQueue {
-	pub(crate) fn new(
+	/// Builds the queue over `kv_store`, starting from the events a previous run left unhandled.
+	///
+	/// The queue is persisted under [`EVENT_QUEUE_PERSISTENCE_KEY`] after every push and every
+	/// [`EventQueue::event_handled`], so the stored copy is exactly the set of events the user has
+	/// not acknowledged yet. Loading it means an event emitted shortly before a shutdown, or one
+	/// the user never got to handle, is delivered on the next run instead of being dropped.
+	///
+	/// A missing key is a fresh wallet and starts empty. Any other read error, or a stored queue
+	/// that does not decode, fails the build: the wallet must not silently start without events
+	/// it owes the user.
+	pub(crate) async fn new(
 		kv_store: Arc<dyn DynStore>, tx_metadata: TxMetadataStore, logger: Arc<Logger>,
-	) -> Self {
-		let queue = Arc::new(Mutex::new(VecDeque::new()));
+	) -> Result<Self, ldk_node::lightning::io::Error> {
+		let persisted = match KVStore::read(
+			kv_store.as_ref(),
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		{
+			Ok(bytes) => {
+				EventQueueDeserWrapper::read(&mut &bytes[..])
+					.map_err(|e| {
+						log_error!(logger.as_ref(), "Failed to deserialize event queue: {}", e);
+						ldk_node::lightning::io::Error::new(
+							ldk_node::lightning::io::ErrorKind::InvalidData,
+							"Failed to deserialize EventQueue",
+						)
+					})?
+					.0
+			},
+			Err(e) if e.kind() == ldk_node::lightning::io::ErrorKind::NotFound => VecDeque::new(),
+			Err(e) => {
+				log_error!(logger.as_ref(), "Failed to read event queue from store: {}", e);
+				return Err(e);
+			},
+		};
+		if !persisted.is_empty() {
+			log_info!(
+				logger.as_ref(),
+				"Loaded {} unhandled event(s) from the store",
+				persisted.len()
+			);
+		}
+		let queue = Arc::new(Mutex::new(persisted));
 		let pending_mpp_events = Arc::new(Mutex::new(HashMap::new()));
 		let notify = Arc::new(Notify::new());
 		let rebalance_enabled = RebalanceEnabledCache::new(Arc::clone(&kv_store));
-		Self { queue, pending_mpp_events, notify, kv_store, rebalance_enabled, tx_metadata, logger }
+		Ok(Self {
+			queue,
+			pending_mpp_events,
+			notify,
+			kv_store,
+			rebalance_enabled,
+			tx_metadata,
+			logger,
+		})
 	}
 
 	pub(crate) async fn get_rebalance_enabled(&self) -> bool {
@@ -465,7 +515,9 @@ mod tests {
 			store,
 			tx_metadata.clone(),
 			Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger")),
-		);
+		)
+		.await
+		.expect("event queue");
 
 		let payment_hash = PaymentHash([3u8; 32]);
 		let surface_id = PaymentId::Trusted([7u8; 32]);
@@ -516,6 +568,57 @@ mod tests {
 			payment_hash: Some(PaymentHash([tag; 32])),
 			reason: None,
 		}
+	}
+
+	/// The queue is persisted after every push and every acknowledgement; a queue built over the
+	/// same store must start from that copy, or every event still unhandled at a shutdown is lost.
+	#[tokio::test]
+	async fn unhandled_events_survive_a_restart() {
+		let (_path, store) = temp_sqlite_store();
+		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+
+		let queue = EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger))
+			.await
+			.expect("event queue");
+		queue.add_event(failed_payment(1)).await.expect("push");
+		queue.add_event(failed_payment(2)).await.expect("push");
+		drop(queue);
+
+		let queue = EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger))
+			.await
+			.expect("event queue");
+		assert_eq!(queue.next_event().await, Some(failed_payment(1)));
+		queue.event_handled().await.expect("ack");
+		assert_eq!(queue.next_event().await, Some(failed_payment(2)));
+		drop(queue);
+
+		// The acknowledgement was persisted too: only the second event comes back.
+		let queue =
+			EventQueue::new(Arc::clone(&store), tx_metadata, logger).await.expect("event queue");
+		assert_eq!(queue.next_event().await, Some(failed_payment(2)));
+		queue.event_handled().await.expect("ack");
+		assert_eq!(queue.next_event().await, None);
+	}
+
+	/// A stored queue that does not decode fails the build instead of starting empty.
+	#[tokio::test]
+	async fn an_undecodable_stored_queue_fails_the_build() {
+		let (_path, store) = temp_sqlite_store();
+		// One event announced, then a variant id no `Event` has.
+		KVStore::write(
+			store.as_ref(),
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+			vec![0x00, 0x01, 0xff],
+		)
+		.await
+		.expect("write");
+		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
+		let err = EventQueue::new(store, tx_metadata, logger).await.err().expect("must fail");
+		assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 	}
 
 	/// A store whose writes wait for the test to open a gate, so a push can be held inside
@@ -629,7 +732,8 @@ mod tests {
 		let store: Arc<dyn DynStore> = Arc::new(GatedStore { inner: Arc::clone(&sqlite), gate });
 		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
 		let tx_metadata = TxMetadataStore::new(sqlite).await;
-		let queue = Arc::new(EventQueue::new(store, tx_metadata, logger));
+		let queue =
+			Arc::new(EventQueue::new(store, tx_metadata, logger).await.expect("event queue"));
 
 		// The consumer waits on an empty queue.
 		let consumer = Arc::new(PollOnWake::new({
@@ -683,8 +787,11 @@ mod tests {
 		let (path, store) = temp_sqlite_store();
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
 		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
-		let event_queue =
-			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
+		let event_queue = Arc::new(
+			EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger))
+				.await
+				.expect("event queue"),
+		);
 
 		let mut builder = ldk_node::Builder::new();
 		builder.set_network(ldk_node::bitcoin::Network::Regtest);
@@ -773,6 +880,21 @@ impl Writeable for EventQueueSerWrapper<'_> {
 			e.write(writer)?;
 		}
 		Ok(())
+	}
+}
+
+struct EventQueueDeserWrapper(VecDeque<Event>);
+
+impl Readable for EventQueueDeserWrapper {
+	fn read<R: ldk_node::lightning::io::Read>(
+		reader: &mut R,
+	) -> Result<Self, ldk_node::lightning::ln::msgs::DecodeError> {
+		let len: u16 = Readable::read(reader)?;
+		let mut queue = VecDeque::with_capacity(len as usize);
+		for _ in 0..len {
+			queue.push_back(Readable::read(reader)?);
+		}
+		Ok(Self(queue))
 	}
 }
 

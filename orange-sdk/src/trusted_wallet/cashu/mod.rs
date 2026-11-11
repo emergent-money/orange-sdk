@@ -1067,8 +1067,11 @@ mod tests {
 		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).unwrap());
 		let runtime = Arc::new(Runtime::new(Arc::clone(&logger)).unwrap());
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
-		let event_queue =
-			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
+		let event_queue = Arc::new(
+			EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger))
+				.await
+				.expect("event queue"),
+		);
 		let cashu_config = CashuConfig {
 			mint_url: "http://127.0.0.1:1".to_owned(),
 			unit: CurrencyUnit::Sat,

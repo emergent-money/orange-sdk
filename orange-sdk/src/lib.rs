@@ -692,8 +692,9 @@ impl Wallet {
 		// but both are initialized concurrently, so it is handed over once both are ready.
 		let (trusted_sender, trusted_handle) = watch::channel(None);
 
-		let event_queue =
-			Arc::new(EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)));
+		let event_queue = Arc::new(
+			EventQueue::new(Arc::clone(&store), tx_metadata.clone(), Arc::clone(&logger)).await?,
+		);
 
 		// Cashu must init before LDK Node because CashuKvDatabase does
 		// synchronous SQLite reads that deadlock with LDK Node's background
