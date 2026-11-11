@@ -234,8 +234,9 @@ impl EventQueue {
 	///
 	/// Delivery is at-least-once: an LDK event is persisted here before it is acknowledged to
 	/// ldk-node, so a crash between the two delivers it again after a restart, once from this
-	/// queue and once from ldk-node's own replay. Consumers must be idempotent, as ldk-node
-	/// already requires of its event handlers.
+	/// queue and once from ldk-node's own replay. Consumers must tolerate a repeat, as consumers
+	/// of ldk-node's own queue already must: it is reloaded at build time and an event stays at
+	/// its front until `event_handled`.
 	///
 	/// A missing key is a fresh wallet and starts empty. Any other read error, or a stored queue
 	/// that does not decode, fails the build: the wallet must not silently start without events
@@ -624,6 +625,54 @@ mod tests {
 		let tx_metadata = TxMetadataStore::new(Arc::clone(&store)).await;
 		let err = EventQueue::new(store, tx_metadata, logger).await.err().expect("must fail");
 		assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+	}
+
+	/// A store that cannot be read at all; everything else goes to the real store.
+	struct ReadFailsStore(Arc<dyn DynStore>);
+
+	impl DynStore for ReadFailsStore {
+		fn read_async(
+			&self, _p: &str, _s: &str, _k: &str,
+		) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, io::Error>> + Send + 'static>> {
+			Box::pin(async { Err(io::Error::new(io::ErrorKind::Other, "store down")) })
+		}
+
+		fn write_async(
+			&self, p: &str, s: &str, k: &str, buf: Vec<u8>,
+		) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + 'static>> {
+			self.0.write_async(p, s, k, buf)
+		}
+
+		fn remove_async(
+			&self, p: &str, s: &str, k: &str, lazy: bool,
+		) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + 'static>> {
+			self.0.remove_async(p, s, k, lazy)
+		}
+
+		fn list_async(
+			&self, p: &str, s: &str,
+		) -> Pin<Box<dyn Future<Output = Result<Vec<String>, io::Error>> + Send + 'static>> {
+			self.0.list_async(p, s)
+		}
+
+		fn list_paginated_async(
+			&self, p: &str, s: &str, page_token: Option<PageToken>,
+		) -> Pin<Box<dyn Future<Output = Result<PaginatedListResponse, io::Error>> + Send + 'static>>
+		{
+			self.0.list_paginated_async(p, s, page_token)
+		}
+	}
+
+	/// A store that cannot be read fails the build with the store's own error; the queue never
+	/// starts empty over a store it could not read.
+	#[tokio::test]
+	async fn an_unreadable_store_fails_the_build() {
+		let (_path, sqlite) = temp_sqlite_store();
+		let tx_metadata = TxMetadataStore::new(Arc::clone(&sqlite)).await;
+		let store: Arc<dyn DynStore> = Arc::new(ReadFailsStore(sqlite));
+		let logger = Arc::new(Logger::new(&LoggerType::LogFacade).expect("logger"));
+		let err = EventQueue::new(store, tx_metadata, logger).await.err().expect("must fail");
+		assert_eq!(err.kind(), io::ErrorKind::Other);
 	}
 
 	/// A store whose writes wait for the test to open a gate, so a push can be held inside
